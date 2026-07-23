@@ -107,6 +107,22 @@ CONFIG = {
     "ENABLE_PREFIX_RENAME": False,
     # True = try to clean up leftover redirectors after moving assets.
     "CLEAN_REDIRECTORS": True,
+    # Safety net for the line above: True (recommended, default) = before
+    # actually deleting a redirector, ALSO double-check the asset
+    # registry's own get_referencers() (hard+soft references) when this
+    # build exposes it, on top of the existing find_package_referencers_
+    # for_asset check. Research/field report: find_package_referencers_
+    # for_asset does not reliably report every SOFT reference on every
+    # UEFN build, which let a still-soft-referenced redirector get
+    # deleted in a live sort (breaking that reference the instant the
+    # redirector was gone: "soft references a missing package"). When
+    # either check reports a referencer, either one raises, or get_
+    # referencers is simply unavailable on this build (no way to double-
+    # check at all), the redirector is KEPT instead of deleted -- left
+    # behind and reported in the run summary, but never a broken
+    # reference. Set to False to go back to the old single-check
+    # criterion (find_package_referencers_for_asset only).
+    "CONSERVATIVE_REDIRECTORS": True,
     # True = double-check the result after applying (recommended).
     "VERIFY_AFTER": True,
     # True = after applying (or undoing), remove folders the moves left
@@ -322,6 +338,7 @@ class Capabilities:
         self.soft_path_rename = False
         self.collect_garbage = False
         self.dependency_query = False
+        self.referencer_query = False
 
     def report(self):
         """Printable lines for probe mode and the summary log."""
@@ -329,7 +346,7 @@ class Capabilities:
             "editor_dialog", "selected_folders", "path_view_folders",
             "scoped_slow_task", "fix_up_redirectors", "class_paths_filter",
             "project_root_api", "soft_path_rename", "collect_garbage",
-            "dependency_query",
+            "dependency_query", "referencer_query",
         )
         lines = ["Sortilege capability probe:"]
         for name in names:
@@ -411,6 +428,15 @@ def probe_capabilities():
         )
     except Exception:
         caps.dependency_query = False
+
+    try:
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        caps.referencer_query = (
+            hasattr(registry, "get_referencers")
+            and hasattr(unreal, "AssetRegistryDependencyOptions")
+        )
+    except Exception:
+        caps.referencer_query = False
 
     return caps
 
@@ -1352,11 +1378,13 @@ def _format_redirector_cleanup(redirector_cleanup):
 def _format_verify(verify):
     if not verify:
         return "not run"
-    return "ok=%s missing=%d old_paths_alive=%d leftover_redirectors=%d" % (
+    return ("ok=%s missing=%d old_paths_alive=%d leftover_redirectors=%d "
+            "broken_soft_refs=%d") % (
         verify.get("ok"),
         len(verify.get("missing", [])),
         len(verify.get("old_paths_alive", [])),
         len(verify.get("leftover_redirectors", [])),
+        len(verify.get("broken_soft_refs", [])),
     )
 
 
@@ -1753,32 +1781,48 @@ def execute_plan(plan, caps, undo_log, progress=None, tracer=None, gc_enabled=No
 def fix_soft_references(results, caps, tracer=None):
     """Best-effort fix-up of FSoftObjectPath references to every asset
     moved in this run, gated on caps.soft_path_rename. Builds one
-    {old_object_path: new_object_path} map for the whole batch, collects
-    the union of find_package_referencers_for_asset() packages across
-    BOTH the OLD and the NEW path of every moved pair, and calls
-    AssetTools.rename_referencing_soft_object_paths(referencer_packages,
-    map) exactly ONCE (research: "renames all FSoftObjectPath object[s]
-    with the old asset path to the new one").
+    {old_object_path: new_object_path} map for the whole batch, then
+    checks a COMPREHENSIVE package set with AssetTools.rename_
+    referencing_soft_object_paths(packages_to_check, map) (research:
+    "renames all FSoftObjectPath object[s] with the old asset path to the
+    new one").
 
-    `tracer`, if given (a CrashTracer), gets one mark() immediately
-    before that one call, naming how many referencer packages are about
-    to be rewritten -- run_apply() is the only caller that passes this
-    (gated by CONFIG["FIX_SOFT_REFERENCES"] and SAFE_MODE; see there).
+    Root-cause fix (field report): find_package_referencers_for_asset()
+    is NOT a reliable index of every SOFT referencer on every UEFN build
+    -- a live sort moved an asset, cleanup_redirectors() correctly saw no
+    referencers for its redirector via that query and deleted it, but a
+    DIFFERENT asset still held a soft reference to the old path that this
+    function had never even attempted to fix, because that asset was
+    never in its (then referencer-graph-scoped) package list either.
+    "soft references a missing package" was the result.
 
-    Querying only the NEW path is not enough: the packages still holding
-    a stale soft reference are found at the OLD path, through the
-    redirector left behind there -- the SAME orientation cleanup_
-    redirectors() already uses for its own referencer queries. Which side
-    actually carries the referencer-graph entry for a still-stale soft
-    reference is not guaranteed the same way on every build, so both ends
-    of every moved pair are queried, independently and fail-soft, and the
-    results are unioned.
+    The fix: `packages_to_check` is now the union of (a) the SAME
+    find_package_referencers_for_asset() query as before, across BOTH the
+    OLD and the NEW path of every moved pair (kept as a belt-and-braces
+    net for any referencer living outside the discovered content roots,
+    e.g. an Engine/plugin mount), and (b) EVERY asset package under every
+    discovered content root (discover_content_roots() + list_assets()) --
+    so every soft reference to a moved asset gets a chance to be
+    repointed, regardless of whether the referencer-graph query above
+    happened to surface it. Handing rename_referencing_soft_object_paths
+    a package that has nothing to rewrite is a harmless no-op for that
+    package.
 
-    Returns True on a successful call, False if the call itself raised,
-    and None when the capability is simply absent on this build --
-    redirectors left in place still resolve soft refs correctly, so
-    nothing breaks when this returns None; it just means those soft refs
-    survive as redirector hops instead of being rewritten in place."""
+    The comprehensive package list is split into CHUNK_SIZE-sized batches
+    (a few hundred each) so one apply on a very large project never hands
+    a single native call an unbounded list; each chunk is its own try/
+    except -- one bad chunk is fail-soft (does not abort the rest of the
+    batch). `tracer`, if given (a CrashTracer), gets one mark() before the
+    chunked calls begin, naming the total comprehensive package count --
+    run_apply() is the only caller that passes this (gated by CONFIG
+    ["FIX_SOFT_REFERENCES"] and SAFE_MODE; see there).
+
+    Returns True when every chunk's call succeeded, False if at least one
+    chunk raised, and None when the capability is simply absent on this
+    build -- redirectors left in place still resolve soft refs correctly,
+    so nothing breaks when this returns None; it just means those soft
+    refs survive as redirector hops instead of being rewritten in
+    place."""
     if not caps.soft_path_rename or unreal is None:
         return None
 
@@ -1797,15 +1841,41 @@ def fix_soft_references(results, caps, tracer=None):
             except Exception:
                 continue
 
+    # COMPREHENSIVE NET -- see docstring above: every project package,
+    # not just the referencer-graph hits collected above.
+    for root in discover_content_roots():
+        try:
+            referencer_packages.update(
+                lib.list_assets(root, recursive=True, include_folder=False))
+        except Exception:
+            continue
+
     try:
         tools = unreal.AssetToolsHelpers.get_asset_tools()
-        sorted_packages = sorted(referencer_packages)
-        if tracer is not None:
-            tracer.mark("rename_referencing_soft_object_paths (%d packages)" % len(sorted_packages))
-        tools.rename_referencing_soft_object_paths(sorted_packages, old_to_new)
-        return True
     except Exception:
         return False
+
+    sorted_packages = sorted(referencer_packages)
+    if tracer is not None:
+        tracer.mark("rename_referencing_soft_object_paths (%d packages)" % len(sorted_packages))
+
+    CHUNK_SIZE = 300
+    if sorted_packages:
+        chunks = [sorted_packages[i:i + CHUNK_SIZE]
+                  for i in range(0, len(sorted_packages), CHUNK_SIZE)]
+    else:
+        # No candidate packages at all -- still make exactly one call
+        # (with an empty list), matching the pre-comprehensive behavior
+        # of always calling the API once per batch of moves.
+        chunks = [[]]
+
+    all_ok = True
+    for chunk in chunks:
+        try:
+            tools.rename_referencing_soft_object_paths(chunk, old_to_new)
+        except Exception:
+            all_ok = False
+    return all_ok
 
 
 # =====================================================================
@@ -1881,6 +1951,37 @@ def find_redirectors(scope_folders, caps):
     return results
 
 
+def _registry_referencers_or_none(path, caps, include_hard=True, include_soft=True):
+    """Query unreal.AssetRegistry.get_referencers(path, options) for every
+    package that references `path` (hard and/or soft, per the include_
+    flags), gated on caps.referencer_query. Returns None -- "could not
+    double-check" -- when the capability is absent, the registry/options
+    can't be constructed, or the call itself raises (or itself returns
+    None, which the real API's own docs allow for "operation could not be
+    completed"). Callers treat None conservatively but NOT identically:
+    cleanup_redirectors' CONSERVATIVE_REDIRECTORS check treats None the
+    same as "found a referencer" (never delete on an unconfirmed empty
+    result); verify_results' broken_soft_refs check treats None as
+    "nothing to report" (an absent capability must not manufacture a
+    false failure on every such build) -- see each call site."""
+    if not caps.referencer_query or unreal is None:
+        return None
+    try:
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        try:
+            options = unreal.AssetRegistryDependencyOptions(
+                include_hard_package_references=include_hard,
+                include_soft_package_references=include_soft)
+        except Exception:
+            options = unreal.AssetRegistryDependencyOptions()
+        refs = registry.get_referencers(path, options)
+    except Exception:
+        return None
+    if refs is None:
+        return None
+    return list(refs)
+
+
 def cleanup_redirectors(scope_folders, caps, tracer=None, gc_enabled=None,
                          progress_hook=None):
     """Clean up every redirector found under `scope_folders`. Returns
@@ -1895,29 +1996,72 @@ def cleanup_redirectors(scope_folders, caps, tracer=None, gc_enabled=None,
     execute_plan()'s matching parameter and _effective_gc_enabled().
 
     `progress_hook`, if given, is called as progress_hook(processed,
-    total) every 5 items processed in the manual-recipe loop below (the
-    part of this pass that can run for minutes on a big redirector
-    batch, with nothing else in this file pumping the GUI's window in
-    the meantime) -- `total` is len(the manual loop's own remaining_
-    paths), not the raw redirector count, so it always matches what is
-    actually being iterated here. Every call is its own try/except and a
-    no-op when progress_hook is None (the console path is unaffected).
+    total) every 5 items processed in EACH of the two manual-recipe
+    phases below (the part of this pass that can run for minutes on a
+    big redirector batch, with nothing else in this file pumping the
+    GUI's window in the meantime) -- `total` is the size of whichever
+    phase's own worklist is currently running (the unique-referencer
+    count in the resave phase, the redirector count in the delete phase),
+    so it always matches what is actually being iterated. Every call is
+    its own try/except and a no-op when progress_hook is None (the
+    console path is unaffected).
 
     Chain: (1) if caps.fix_up_redirectors (future-proofing -- no shipped
     engine has this today), load each redirector's own asset object via
     find_asset_data(p).get_asset() and hand the batch to AssetTools.
     fix_up_redirectors(); whatever is confirmed gone afterward counts as
     fixed, anything left over falls through to (2); (2) the manual
-    recipe, the real path today: for each remaining redirector, find its
-    referencers (load_assets_to_confirm=True), load + resave each one
-    (only_if_is_dirty=False forces the resave regardless of dirty state),
-    then re-check the referencer list; empty -> delete_asset() + verify
-    gone -> fixed; still non-empty -> remaining with "still referenced
-    by: ...". Every item is its own try/except -- an exception moves that
-    item to remaining with the error text instead of aborting the batch.
-    Gated collect_garbage() every 10 redirectors processed in the manual
-    loop (research: mirrors the community fixup tooling's own
-    batch-and-GC throttle so this never sweeps unbounded memory)."""
+    recipe, the real path today, now BATCHED across 3 passes instead of
+    one loop that repeated work per redirector:
+
+      (a) GATHER -- for each remaining redirector p, find its referencers
+          (load_assets_to_confirm=True) and fold every referencer path
+          into one deduplicated `all_referencers` list (first-seen
+          order). A redirector whose referencer lookup itself raises
+          goes straight to "remaining" with the error text here, exactly
+          like the old single loop, and is excluded from (b)/(c).
+
+      (b) RESAVE -- load + resave (only_if_is_dirty=False forces the
+          resave regardless of dirty state) each package in
+          `all_referencers` exactly ONCE for the whole batch. Resaving a
+          package rewrites ALL of its stale redirector-path references in
+          one write, so one resave per unique referencer is both
+          sufficient and -- unlike the old per-redirector loop, which
+          could load+resave the SAME shared referencer once per
+          redirector it happened to touch -- never redundant.
+
+      (c) DELETE -- for each remaining redirector (skipping any that
+          already failed in (a)), re-check its referencer list; still
+          non-empty -> remaining with "still referenced by: ...". EMPTY
+          is no longer an automatic delete: when CONFIG["CONSERVATIVE_
+          REDIRECTORS"] is True (the default), an empty find_package_
+          referencers_for_asset() result is ALSO double-checked against
+          AssetRegistry.get_referencers() (hard+soft) via _registry_
+          referencers_or_none() -- see its docstring and CONFIG's own
+          comment for the field-reported incident this exists to close.
+          Only when BOTH checks confirm zero referencers does delete_
+          asset() + verify-gone -> fixed actually run; otherwise the
+          redirector lands in remaining with "kept: still referenced
+          (possible soft reference)" -- covering a referencer either
+          check found, either check raising, and the capability being
+          unavailable altogether (nothing to double-check with). Every
+          item in every phase is its own try/except -- an exception moves
+          that item to remaining with the error text instead of aborting
+          the batch.
+
+    With CONFIG["CONSERVATIVE_REDIRECTORS"] at its default (True), a
+    redirector that used to get silently deleted on an unconfirmed-empty
+    referencer list now survives into `remaining` instead -- the one
+    deliberate behavior change from the old per-redirector loop. With it
+    set to False, the {fixed, remaining} outcome is identical to the old
+    algorithm for the same input; only the number of resave calls (and
+    hence wall-clock time on a batch with shared referencers) changes.
+
+    Gated collect_garbage() every 10 packages resaved in (b) AND,
+    independently, every 10 redirectors processed in (c) (two separate
+    counters -- research: mirrors the community fixup tooling's own
+    batch-and-GC throttle so neither phase ever sweeps unbounded
+    memory)."""
     result = {"fixed": [], "remaining": [], "method": "manual"}
     if unreal is None:
         return result
@@ -1962,44 +2106,110 @@ def cleanup_redirectors(scope_folders, caps, tracer=None, gc_enabled=None,
     remaining_paths = [p for p in redirector_paths if p not in handled]
     total_remaining = len(remaining_paths)
 
-    gc_count = 0
+    # --- (a) GATHER: one referencer lookup per redirector, folded into a
+    # single deduplicated worklist (first-seen order) -----------------
+    referencers_by_redirector = {}
+    all_referencers = []
+    seen_referencers = set()
+    for p in remaining_paths:
+        try:
+            referencers = lib.find_package_referencers_for_asset(p, True)
+        except Exception as exc:
+            result["remaining"].append((p, str(exc)))
+            continue
+        referencers_by_redirector[p] = referencers
+        for ref in referencers:
+            if ref not in seen_referencers:
+                seen_referencers.add(ref)
+                all_referencers.append(ref)
+
+    # --- (b) RESAVE: each unique referencer, exactly once ------------
+    total_referencers = len(all_referencers)
+    resave_gc_count = 0
+    for index, ref in enumerate(all_referencers, start=1):
+        if progress_hook is not None and index % 5 == 0:
+            try:
+                progress_hook(index, total_referencers)
+            except Exception:
+                pass
+        try:
+            if tracer is not None:
+                tracer.mark("resave referencer: %s" % ref)
+            obj = lib.load_asset(ref)
+            if obj is not None:
+                lib.save_loaded_asset(obj, only_if_is_dirty=False)
+        except Exception:
+            pass
+
+        resave_gc_count += 1
+        if gc_enabled and resave_gc_count % 10 == 0:
+            if tracer is not None:
+                tracer.mark("collect_garbage (n=%d)" % resave_gc_count)
+            try:
+                unreal.SystemLibrary.collect_garbage()
+            except Exception:
+                pass
+
+    # --- (c) DELETE: re-check + remove, skipping anything (a) already
+    # sent to "remaining" -- index/total stay over the FULL remaining_
+    # paths list (not just the ones that survived (a)) so progress_hook's
+    # cadence is byte-identical to the old single-loop numbering ------
+    #
+    # P0 SAFETY NET (CONFIG["CONSERVATIVE_REDIRECTORS"], default True):
+    # find_package_referencers_for_asset() alone is not a reliable index
+    # of every SOFT referencer on every UEFN build (field report -- see
+    # fix_soft_references()'s docstring for the exact incident this
+    # closes). Before trusting an empty `still_refs`, ALSO double-check
+    # with the asset registry's own get_referencers() (hard+soft) when
+    # this build exposes it. Delete only if the UNION of both checks is
+    # empty; if either reports a referencer, either raises, or get_
+    # referencers is simply unavailable (no way to double-check at all),
+    # KEEP the redirector instead of risking a broken reference. When
+    # CONSERVATIVE_REDIRECTORS is False, the old single-check criterion
+    # applies unchanged.
+    conservative = bool(CONFIG.get("CONSERVATIVE_REDIRECTORS", True))
+    delete_gc_count = 0
     for index, p in enumerate(remaining_paths, start=1):
         if progress_hook is not None and index % 5 == 0:
             try:
                 progress_hook(index, total_remaining)
             except Exception:
                 pass
-        try:
-            referencers = lib.find_package_referencers_for_asset(p, True)
-            for ref in referencers:
-                try:
-                    if tracer is not None:
-                        tracer.mark("resave referencer: %s" % ref)
-                    obj = lib.load_asset(ref)
-                    if obj is not None:
-                        lib.save_loaded_asset(obj, only_if_is_dirty=False)
-                except Exception:
-                    continue
 
-            still_refs = lib.find_package_referencers_for_asset(p, False)
-            if not still_refs:
-                if tracer is not None:
-                    tracer.mark("delete_asset redirector: %s" % p)
-                lib.delete_asset(p)
-                if not lib.does_asset_exist(p):
-                    result["fixed"].append(p)
-                else:
-                    result["remaining"].append((p, "delete_asset did not remove it"))
+        if p in referencers_by_redirector:
+            try:
+                still_refs = lib.find_package_referencers_for_asset(p, False)
+            except Exception as exc:
+                result["remaining"].append((p, str(exc)))
+                still_refs = None
             else:
-                result["remaining"].append(
-                    (p, "still referenced by: " + ", ".join(still_refs)))
-        except Exception as exc:
-            result["remaining"].append((p, str(exc)))
+                keep_reason = None
+                if still_refs:
+                    keep_reason = "still referenced by: " + ", ".join(still_refs)
+                elif conservative:
+                    registry_refs = _registry_referencers_or_none(p, caps)
+                    if registry_refs is None or len(registry_refs) > 0:
+                        keep_reason = "kept: still referenced (possible soft reference)"
 
-        gc_count += 1
-        if gc_enabled and gc_count % 10 == 0:
+                if keep_reason is not None:
+                    result["remaining"].append((p, keep_reason))
+                else:
+                    try:
+                        if tracer is not None:
+                            tracer.mark("delete_asset redirector: %s" % p)
+                        lib.delete_asset(p)
+                        if not lib.does_asset_exist(p):
+                            result["fixed"].append(p)
+                        else:
+                            result["remaining"].append((p, "delete_asset did not remove it"))
+                    except Exception as exc:
+                        result["remaining"].append((p, str(exc)))
+        # else: (a) already recorded this redirector into result["remaining"].
+
+        delete_gc_count += 1
+        if gc_enabled and delete_gc_count % 10 == 0:
             if tracer is not None:
-                tracer.mark("collect_garbage (n=%d)" % gc_count)
+                tracer.mark("collect_garbage (n=%d)" % delete_gc_count)
             try:
                 unreal.SystemLibrary.collect_garbage()
             except Exception:
@@ -2020,7 +2230,8 @@ def cleanup_redirectors(scope_folders, caps, tracer=None, gc_enabled=None,
 def verify_results(results, scope_folders, caps):
     """Double-check an apply run's outcome. Returns {"ok": bool,
     "missing": [...], "old_paths_alive": [...], "leftover_redirectors":
-    [...], "referencer_spot_checks": int}.
+    [...], "referencer_spot_checks": int, "broken_soft_refs": [(referencer,
+    old_path), ...]}.
 
     For every moved (old, new) pair: `new` must exist (else -> missing);
     `old` must no longer resolve to a REAL (non-redirector) asset --
@@ -2030,9 +2241,26 @@ def verify_results(results, scope_folders, caps):
     counted but not scored). Leftover redirectors anywhere under
     `scope_folders` are listed for information only -- they resolve
     correctly, they're just clutter, so they never affect `ok`.
-    `ok` = no missing AND no old_paths_alive."""
+
+    P2 (soft-reference bounty fix): if `old` no longer resolves AT ALL --
+    no redirector left to hop through, no live asset either -- but some
+    OTHER package still SOFT-references that exact old path (via
+    AssetRegistry.get_referencers(), soft-only, gated on caps.
+    referencer_query), that is a genuinely BROKEN reference: the exact
+    failure mode CONSERVATIVE_REDIRECTORS (cleanup_redirectors) and the
+    comprehensive rewrite (fix_soft_references) exist to prevent. Each
+    hit is recorded as a (referencer_package, old_path) pair in
+    "broken_soft_refs". A leftover redirector at `old` is NOT broken --
+    it still resolves the soft reference correctly, just with an extra
+    hop -- so this check only ever runs once `old` is entirely gone.
+    When caps.referencer_query is unavailable, this check is silently
+    skipped (like the referencer_spot_checks above, it degrades to "not
+    checked", never to a false "broken").
+
+    `ok` = no missing AND no old_paths_alive AND no broken_soft_refs."""
     out = {"ok": True, "missing": [], "old_paths_alive": [],
-           "leftover_redirectors": [], "referencer_spot_checks": 0}
+           "leftover_redirectors": [], "referencer_spot_checks": 0,
+           "broken_soft_refs": []}
     if unreal is None:
         return out
 
@@ -2067,11 +2295,27 @@ def verify_results(results, scope_folders, caps):
         except Exception:
             pass
 
+        try:
+            old_gone_entirely = not lib.does_asset_exist(old)
+        except Exception:
+            old_gone_entirely = False
+        if old_gone_entirely:
+            registry_refs = _registry_referencers_or_none(
+                old, caps, include_hard=False, include_soft=True)
+            for ref in (registry_refs or []):
+                entry = (str(ref), old)
+                if entry not in out["broken_soft_refs"]:
+                    out["broken_soft_refs"].append(entry)
+
     for p in find_redirectors(scope_folders, caps):
         if p not in out["leftover_redirectors"]:
             out["leftover_redirectors"].append(p)
 
-    out["ok"] = (not out["missing"]) and (not out["old_paths_alive"])
+    out["ok"] = (
+        (not out["missing"])
+        and (not out["old_paths_alive"])
+        and (not out["broken_soft_refs"])
+    )
     return out
 
 
@@ -3630,6 +3874,10 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
         if empty_removed:
             summary_text += ", %d empty folder%s removed" % (
                 empty_removed, "" if empty_removed == 1 else "s")
+        broken_soft_refs = len((results.get("verify") or {}).get("broken_soft_refs", []))
+        if broken_soft_refs:
+            summary_text += ", %d BROKEN soft reference%s (see report)" % (
+                broken_soft_refs, "" if broken_soft_refs == 1 else "s")
         summary_text += " - full report: %s" % outcome["report_path"]
 
         result_var = tk.StringVar(master=root)

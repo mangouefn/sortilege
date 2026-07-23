@@ -24,6 +24,16 @@ depends on, including the semantics that matter for reference-safe moves:
   full object path ("...Name.Name") for both source and destination, like
   the real API. ``AssetData.is_redirector()``/``.get_asset()`` are always
   present (not feature-gated).
+- ``add_asset(path, class_name, deps=, soft_deps=)`` models TWO separate
+  reference kinds: ``deps`` (hard-like -- auto-rewritten by a rename,
+  resolved by a resave) and ``soft_deps`` (true FSoftObjectPath modeling
+  -- never touched by a rename or a plain resave, only by
+  ``AssetTools.rename_referencing_soft_object_paths``). ``AssetRegistry.
+  get_referencers`` (gated by the "dependency_query" feature switch,
+  alongside ``get_dependencies``) sees BOTH; ``EditorAssetLibrary.
+  find_package_referencers_for_asset`` only ever sees ``deps`` -- the
+  deliberate field-gap Sortilege's conservative redirector-deletion path
+  is built to survive.
 
 Stdlib only.
 """
@@ -402,6 +412,12 @@ class EditorAssetLibrary:
           deleted yet, but not this one. Without this distinction, the
           redirector-cleanup recipe could never reach "zero referencers"
           for any asset that's still legitimately used anywhere.
+
+        Deliberately NEVER scans `soft_deps` -- this mirrors the real-
+        world field gap this build's redirector cleanup has to defend
+        against: find_package_referencers_for_asset() is not a reliable
+        index of every SOFT referencer. AssetRegistry.get_referencers()
+        (below) is the one query that DOES see `soft_deps`.
         """
         target = _resolve(path)
         if path == target:
@@ -485,6 +501,46 @@ def _get_dependencies_impl(self, package_name, options):
     return [Name(dep) for dep in asset.get("deps", [])]
 
 
+def _get_referencers_impl(self, package_name, options=None):
+    """Mirrors unreal.AssetRegistry.get_referencers(package_name,
+    reference_options) -- the reverse of get_dependencies(): every
+    package that references the supplied one. THE feature-gap query:
+    unlike EditorAssetLibrary.find_package_referencers_for_asset(), this
+    scans BOTH `deps` (hard-reference-like) AND `soft_deps` (true soft-
+    object-path modeling -- see add_asset()) when the options ask for
+    each kind, via the same include_hard_package_references /
+    include_soft_package_references flags get_dependencies() takes.
+
+    Same alias-resolution rule as find_package_referencers_for_asset:
+    querying a real (resolved) path also counts every redirector alias
+    that chains to it; querying a redirector path itself only counts a
+    referencer whose dep/soft_dep is LITERALLY that exact redirector
+    path. Returned as Name objects, like get_dependencies()."""
+    path = str(package_name)
+    target = _resolve(path)
+    if path == target:
+        aliases = {target}
+        for old in _state["redirectors"]:
+            if _resolve(old) == target:
+                aliases.add(old)
+    else:
+        aliases = {path}
+
+    include_hard = getattr(options, "include_hard_package_references", True) \
+        if options is not None else True
+    include_soft = getattr(options, "include_soft_package_references", True) \
+        if options is not None else True
+
+    refs = []
+    for p, data in _state["assets"].items():
+        hit = include_hard and any(d in aliases for d in data.get("deps", []))
+        if not hit and include_soft:
+            hit = any(d in aliases for d in data.get("soft_deps", []))
+        if hit:
+            refs.append(Name(p))
+    return refs
+
+
 _registry_singleton = AssetRegistry()
 
 
@@ -526,12 +582,31 @@ def _fix_up_redirectors_impl(self, redirector_objects):
 def _rename_referencing_soft_object_paths_impl(self, packages, asset_redirector_map):
     """Mirrors unreal.AssetTools.rename_referencing_soft_object_paths --
     records the call (packages checked + the old->new map) so tests can
-    assert Task 4's fix_soft_references() built the right arguments.
-    Behind the "soft_path_rename" feature switch; a genuine no-op with the
-    method entirely absent when that feature is off."""
+    assert fix_soft_references() built the right arguments, AND actually
+    rewrites matching `soft_deps` entries in every package handed in, so
+    the comprehensive-rewrite fix (P1) is assertable end-to-end: a
+    package that owns a stale soft_deps entry ends up pointing at the new
+    path IF (and only if) it's in `packages` -- exactly like the real
+    API, which only touches FSoftObjectPath fields (never the hard
+    `deps` a rename/resave already fixes) in the packages it's told to
+    check. Behind the "soft_path_rename" feature switch; a genuine no-op
+    with the method entirely absent when that feature is off."""
     _state.setdefault("soft_rename_calls", []).append(
         {"packages": list(packages), "map": dict(asset_redirector_map)}
     )
+    pkg_map = {}
+    for old_obj, new_obj in asset_redirector_map.items():
+        old_pkg = old_obj.split(".", 1)[0] if "." in old_obj else old_obj
+        new_pkg = new_obj.split(".", 1)[0] if "." in new_obj else new_obj
+        pkg_map[old_pkg] = new_pkg
+    for pkg in packages:
+        asset_entry = _state["assets"].get(pkg)
+        if asset_entry is None:
+            continue
+        soft_deps = asset_entry.get("soft_deps")
+        if not soft_deps:
+            continue
+        asset_entry["soft_deps"] = [pkg_map.get(d, d) for d in soft_deps]
     return True
 
 
@@ -657,6 +732,8 @@ def _apply_feature_gates(features):
                        features["dependency_query"])
     _gate_class_attr(AssetRegistry, "get_dependencies",
                       _get_dependencies_impl, features["dependency_query"])
+    _gate_class_attr(AssetRegistry, "get_referencers",
+                      _get_referencers_impl, features["dependency_query"])
 
 
 # ---------------------------------------------------------------------------
@@ -687,8 +764,25 @@ def reset(features=None):
     _apply_feature_gates(merged)
 
 
-def add_asset(path, class_name, deps=None):
-    _state["assets"][path] = {"class": class_name, "deps": list(deps) if deps else []}
+def add_asset(path, class_name, deps=None, soft_deps=None):
+    """`deps` models HARD-reference-like dependencies: rewritten
+    immediately (everywhere) by rename_asset()/_do_rename() and resolved
+    by save_loaded_asset(), same as always. `soft_deps` models a TRUE
+    FSoftObjectPath reference: a plain string a rename never touches and
+    a plain resave never resolves -- the only thing that ever rewrites it
+    is AssetTools.rename_referencing_soft_object_paths(), and the only
+    thing that ever SEES it as a referencer is AssetRegistry.
+    get_referencers() (with include_soft_package_references=True);
+    EditorAssetLibrary.find_package_referencers_for_asset() never looks
+    at it. This is the deliberate field-gap Sortilege's conservative
+    redirector-deletion check (CONSERVATIVE_REDIRECTORS) exists to
+    survive: a referencer registered ONLY via `soft_deps` is exactly the
+    kind find_package_referencers_for_asset can miss."""
+    _state["assets"][path] = {
+        "class": class_name,
+        "deps": list(deps) if deps else [],
+        "soft_deps": list(soft_deps) if soft_deps else [],
+    }
     _register_ancestor_folders(path)
 
 

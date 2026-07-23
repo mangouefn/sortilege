@@ -596,6 +596,17 @@ class PerOpTraceMarkTests(unittest.TestCase):
         self.assertIn("collect_garbage (n=10)", content)
 
     def test_rename_referencing_soft_object_paths_mark_appears_with_package_count(self):
+        # P1 (soft-reference bounty fix): fix_soft_references() now checks
+        # EVERY project package under the discovered content root, not
+        # just find_package_referencers_for_asset()'s hits -- the root-
+        # cause fix for a soft referencer that query can miss entirely
+        # (see test_redirectors.py's ConservativeRedirectorDeletionTests
+        # and test_executor.py's ComprehensiveSoftRewriteTests for the
+        # field-reported incident this closes). The count below is
+        # therefore every package under "/ProjectX" after this fixture's
+        # move -- BP_User, Rock's new real location, and Rock's old
+        # (redirector) location -- 3, not just the 1 referencer-graph hit
+        # this mark used to report before the comprehensive scan existed.
         mock_unreal.add_asset("/ProjectX/Blueprints/BP_User", "Blueprint",
                                deps=["/ProjectX/Stuff/Rock"])
         assets = [asset("/ProjectX/Stuff/Rock", "StaticMesh")]
@@ -612,7 +623,7 @@ class PerOpTraceMarkTests(unittest.TestCase):
 
         with open(tracer.path, "r", encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("rename_referencing_soft_object_paths (1 packages)", content)
+        self.assertIn("rename_referencing_soft_object_paths (3 packages)", content)
 
     def test_resave_referencer_mark_appears_flush_only(self):
         # fix_up_redirectors OFF forces the manual recipe, whose resave

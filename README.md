@@ -302,6 +302,19 @@ The three file names always look like this:
 
 ---
 
+## Reference safety
+
+Sortilege's whole design goal is that nothing you move ever ends up with a broken reference. Here is what actually happens, in order, every time you apply:
+
+1. **The move itself** uses the engine's own safe rename API, which leaves a small "pointer" file (a redirector, explained above) at the old location, so anything already pointing there keeps resolving correctly.
+2. **Soft references get repointed project-wide.** Some references (the kind Verse-visible assets and similar dynamically-looked-up content use) are not fixed up automatically by the move itself. Right after every apply, Sortilege checks every asset under your project (not just the ones it can already prove are connected to what moved) and repoints any of these that point at something that moved. This is deliberately broader than just checking "known" connections, because real-world testing found that a narrower check can miss one.
+3. **A leftover pointer file is only ever deleted when double-confirmed safe.** Before removing any leftover pointer file, Sortilege checks TWICE, with two different engine queries, whether anything still points at it. Only when BOTH checks agree nothing does is the pointer file actually removed. If either check finds something, either check fails to run cleanly, or your UEFN build does not support the second check at all, the pointer file is deliberately left in place and listed in the run report under redirector cleanup, rather than risk removing something still in use. (This extra check is controlled by `CONSERVATIVE_REDIRECTORS` in CONFIG, on by default; turning it off is not recommended.)
+4. **The final verify pass proves it.** After everything above, Sortilege checks whether anything is left pointing at a location that no longer exists at all (no asset there, no pointer file either). If it ever finds one, it is called out explicitly, by name, in the run report and the preview window's results line as a "BROKEN soft reference" -- with steps 2 and 3 above in place, this should always come back empty.
+
+The one thing none of this can cover is Verse source code that names an asset directly -- see the caution below. That lives entirely outside the asset system Sortilege scans, so no check against the asset system, however thorough, can see it.
+
+---
+
 ## What it will never touch
 
 Regardless of your settings, Sortilege always leaves the following alone. These are checked before any other rule, so no config combination (including STRICT_MODE or group-by-asset mode) can ever cause one of them to move:
@@ -322,7 +335,9 @@ You may notice there is no "Verse" folder in the destination `FOLDER_MAP`, even 
 
 ## A caution about Verse asset references
 
-If your Verse code refers to an asset by its folder-qualified name (this happens automatically through a feature called Asset Reflection, where Verse can see and reference your content assets directly), moving that asset changes its qualified name in Verse too. Sortilege's redirector cleanup only fixes references inside the asset system itself; it does not, and cannot, rewrite your Verse source code. If you move an asset that your Verse code references, you will need to manually update that reference in your Verse code and rebuild.
+If your Verse code refers to an asset by its folder-qualified name (this happens automatically through a feature called Asset Reflection, where Verse can see and reference your content assets directly), moving that asset changes its qualified name in Verse too. Sortilege's redirector cleanup and its verify pass (see "Reference safety" above) only ever check and fix references inside the asset system itself; neither one can see, or rewrite, your Verse source code. If you move an asset that your Verse code references, you will need to manually update that reference in your Verse code and rebuild.
+
+This is a documented limitation, not a gap in effort: Asset Reflection is a project-wide setting with no per-asset marker Sortilege (or any Python script) can query to ask "is this specific asset one my Verse code names directly?" -- so this cannot be turned into an automatic check the way the asset-system soft-reference check in "Reference safety" above was. The verify pass's "BROKEN soft reference" detection will never catch a broken Verse-source reference for exactly this reason; it can only ever prove the asset system itself stayed intact.
 
 This caution is printed at the bottom of every preview, so you will see it every single time, not just here.
 
@@ -344,7 +359,7 @@ This prints your Python version, your project's content root, a list of which op
 
 **Nothing happened when I ran "apply".** Check that you actually saved `sortilege.py` after changing `I_UNDERSTAND_THIS_MODIFIES_MY_PROJECT` to `True`. If it is still `False`, apply mode always blocks and prints instructions instead of moving anything, on purpose.
 
-**A few redirectors are still hanging around after applying.** Cleanup is best-effort: Sortilege tries to resave everything that points at a moved asset and then remove the leftover redirector, but it can only do this for things it can safely load and resave in your current session. Anything it could not clean up is listed by name in the report under the redirector cleanup section, so you can decide whether to handle those manually (for example, by opening the affected assets once and resaving them yourself).
+**A few redirectors are still hanging around after applying.** Cleanup is best-effort: Sortilege tries to resave everything that points at a moved asset and then remove the leftover redirector, but it can only do this for things it can safely load and resave in your current session. Anything it could not clean up is listed by name in the report under the redirector cleanup section, so you can decide whether to handle those manually (for example, by opening the affected assets once and resaving them yourself). Some of these will be listed with the reason "kept: still referenced (possible soft reference)" -- that is the double-check described in "Reference safety" above declining to delete a pointer file it could not fully confirm was safe to remove. That is working as intended: a leftover pointer file is clutter, not a broken reference, and Sortilege would always rather leave one behind than risk removing one still in use.
 
 **My map/island won't open, or something looks broken after a run.** Restore your backup, or run undo mode as described above. Then check the report file's Skipped and Failed sections for anything unusual before trying again.
 
@@ -354,7 +369,7 @@ This prints your Python version, your project's content root, a list of which op
 
 **Does this touch my Verse code?** No. Verse files are never scanned or moved.
 
-**Will this break references to my assets?** Sortilege moves assets using the engine's own official move function (the same underlying mechanism as manually dragging an asset in the Content Drawer), which is designed to keep references intact. It also runs a verification pass after every real run to double-check nothing came up missing or broken. The one thing it cannot fix is direct Verse code that names an asset by its old folder path, as described above.
+**Will this break references to my assets?** Sortilege moves assets using the engine's own official move function (the same underlying mechanism as manually dragging an asset in the Content Drawer), which is designed to keep references intact, and it repoints references project-wide (not just the ones it can already prove are connected) right after every move -- see "Reference safety" above. It also runs a verification pass after every real run to double-check nothing came up missing or broken, including a dedicated check for any reference left pointing at nothing. The one thing it cannot fix, or even check, is direct Verse code that names an asset by its old folder path, as described above.
 
 **What if I run it by accident with the flag already set to True from a previous session?** Preview mode (running with no extra word, or with "preview") never changes anything no matter what the flag is set to. Only "apply" mode acts on the flag, and even then it still shows you the same dry-run preview first, before the confirm gates are even checked.
 

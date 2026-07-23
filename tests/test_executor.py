@@ -383,5 +383,116 @@ class FixSoftReferencesTests(ExecutorTestBase):
         self.assertIn("/Game/Blueprints/BP_Stale", calls[0]["packages"])
 
 
+# ---------------------------------------------------------------------------
+# P1 -- comprehensive soft-path rewrite. Root-cause fix: find_package_
+# referencers_for_asset() is not a reliable index of every SOFT referencer
+# on every UEFN build (field report -- see test_redirectors.py's P0
+# class for the exact incident). rename_referencing_soft_object_paths()
+# must be handed EVERY project package, not just referencer-graph hits,
+# so a soft reference gets repointed regardless of whether the
+# referencer-graph query happened to surface it.
+# ---------------------------------------------------------------------------
+
+class ComprehensiveSoftRewriteTests(ExecutorTestBase):
+    def test_comprehensive_scan_includes_packages_outside_the_referencer_graph(self):
+        """Two assets with NO relationship at all to the moved asset --
+        nothing links them, nothing would ever put them in find_package_
+        referencers_for_asset's result -- still show up in the package
+        list handed to rename_referencing_soft_object_paths(), proving
+        the scope is "every project package", not "every referencer"."""
+        mock_unreal.add_asset("/Game/Unrelated/Thing1", "Texture2D")
+        mock_unreal.add_asset("/Game/Unrelated/Thing2", "SoundWave")
+        assets = [asset("/Game/Stuff/Rock", "StaticMesh")]
+        plan = self._plan(assets)
+        undo_log = self._undo_log(plan)
+        caps = self.sortilege.probe_capabilities()
+
+        results = self.sortilege.execute_plan(plan, caps, undo_log)
+        outcome = self.sortilege.fix_soft_references(results, caps)
+
+        self.assertTrue(outcome)
+        calls = mock_unreal.get_state()["soft_rename_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/Game/Unrelated/Thing1", calls[0]["packages"])
+        self.assertIn("/Game/Unrelated/Thing2", calls[0]["packages"])
+
+    def test_soft_referencer_outside_the_referencer_graph_still_gets_rewritten(self):
+        """THE root-cause proof: Spinner_red's ONLY reference to RVB2 is a
+        soft one (soft_deps=), which find_package_referencers_for_asset
+        can never see (see mock_unreal.py) -- the OLD code's referencer-
+        graph-only scan would never have handed Spinner_red to
+        rename_referencing_soft_object_paths at all, so its stale soft
+        path would survive untouched. The comprehensive scan must reach
+        it anyway: after fix_soft_references(), Spinner_red's soft_deps
+        entry must point at RVB2's NEW location, not the old one."""
+        mock_unreal.add_asset("/Game/Props/Spinner_red", "Blueprint",
+                               soft_deps=["/Game/Stuff/RVB2"])
+        assets = [asset("/Game/Stuff/RVB2", "StaticMesh")]
+        plan = self._plan(assets)
+        undo_log = self._undo_log(plan)
+        caps = self.sortilege.probe_capabilities()
+
+        results = self.sortilege.execute_plan(plan, caps, undo_log)
+        self.assertEqual(results["moved"], [("/Game/Stuff/RVB2", "/Game/Meshes/RVB2")])
+
+        # Pin the premise: today's single referencer query genuinely
+        # cannot see Spinner_red's soft reference either end of the move.
+        refs_old = mock_unreal.EditorAssetLibrary.find_package_referencers_for_asset(
+            "/Game/Stuff/RVB2")
+        refs_new = mock_unreal.EditorAssetLibrary.find_package_referencers_for_asset(
+            "/Game/Meshes/RVB2")
+        self.assertNotIn("/Game/Props/Spinner_red", refs_old)
+        self.assertNotIn("/Game/Props/Spinner_red", refs_new)
+
+        outcome = self.sortilege.fix_soft_references(results, caps)
+
+        self.assertTrue(outcome)
+        state = mock_unreal.get_state()
+        self.assertEqual(
+            state["assets"]["/Game/Props/Spinner_red"]["soft_deps"],
+            ["/Game/Meshes/RVB2"])
+
+    def test_large_project_chunks_calls_and_is_fail_soft_per_chunk(self):
+        """"chunk if needed for very large projects, e.g. batches of a few
+        hundred, fail-soft per chunk": 650 unrelated packages plus the
+        moved pair must split into multiple rename_referencing_soft_
+        object_paths calls, and a single chunk raising must not stop the
+        others from still being attempted."""
+        for i in range(650):
+            mock_unreal.add_asset("/Game/Bulk/Thing%04d" % i, "Texture2D")
+        assets = [asset("/Game/Stuff/Rock", "StaticMesh")]
+        plan = self._plan(assets)
+        undo_log = self._undo_log(plan)
+        caps = self.sortilege.probe_capabilities()
+        results = self.sortilege.execute_plan(plan, caps, undo_log)
+
+        tools = mock_unreal.AssetToolsHelpers.get_asset_tools()
+        original = type(tools).rename_referencing_soft_object_paths
+        call_count = [0]
+
+        def flaky(self, packages, asset_redirector_map):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise RuntimeError("simulated failure on chunk 2")
+            return original(self, packages, asset_redirector_map)
+
+        type(tools).rename_referencing_soft_object_paths = flaky
+        try:
+            outcome = self.sortilege.fix_soft_references(results, caps)
+        finally:
+            type(tools).rename_referencing_soft_object_paths = original
+
+        calls = mock_unreal.get_state()["soft_rename_calls"]
+        # 650 unrelated + old-redirector-path + new-real-path = 652
+        # packages -> exactly 3 chunks of <= 300 each (300, 300, 52).
+        self.assertEqual(call_count[0], 3)
+        # Chunk 2's call raised BEFORE the real impl ever recorded it, so
+        # only chunks 1 and 3 land in soft_rename_calls -- fail-soft per
+        # chunk means the loop kept going after chunk 2's exception
+        # instead of aborting the remaining chunks.
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(outcome)
+
+
 if __name__ == "__main__":
     unittest.main()
