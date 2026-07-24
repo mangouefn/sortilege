@@ -163,11 +163,15 @@ class RunApplyStatusCallbackTests(unittest.TestCase):
             plan, caps, status_callback=lambda text: calls.append(text))
 
         # A one-item batch never trips the K=5 redirector/empty-folder
-        # progress ticks, so exactly the six stage-boundary calls fire.
+        # progress ticks, so exactly the seven stage-boundary calls fire.
+        # "Rewriting Verse references..." is new: FIX_VERSE_REFERENCES
+        # defaults True (like every sibling post-move pass, it always
+        # announces its stage regardless of whether this run's project
+        # actually has any .verse files to rewrite -- see run_apply()).
         self.assertEqual(calls, [
             "Moving assets...", "Fixing references...",
-            "Cleaning up redirectors...", "Removing empty folders...",
-            "Verifying...", "Writing report...",
+            "Cleaning up redirectors...", "Rewriting Verse references...",
+            "Removing empty folders...", "Verifying...", "Writing report...",
         ])
 
     def test_status_callback_default_none_is_a_noop(self):

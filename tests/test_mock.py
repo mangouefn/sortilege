@@ -4,6 +4,8 @@ These tests exercise the mock directly (no sortilege.py involved -- it does
 not exist yet). Every later task's test suite depends on this mock behaving
 exactly like the real UEFN `unreal` module for the slice of API it covers.
 """
+import os
+import tempfile
 import unittest
 
 import mock_unreal as unreal
@@ -597,6 +599,61 @@ class SoftObjectPathRenameTests(unittest.TestCase):
         unreal.reset(features={"soft_path_rename": False})
         tools = unreal.AssetToolsHelpers.get_asset_tools()
         self.assertFalse(hasattr(tools, "rename_referencing_soft_object_paths"))
+
+
+# ---------------------------------------------------------------------------
+# Verse-dir auto-detect support: unreal.SystemLibrary.get_system_path() +
+# set_project_disk_dir() -- lets resolve_verse_search_dir() derive the real
+# UEFN project directory from a scanned asset's on-disk path instead of
+# trusting unreal.Paths.project_dir() (which in real UEFN resolves to the
+# Fortnite ENGINE directory, not the user's project -- the live-diagnosed
+# bug this whole mechanism exists to fix).
+# ---------------------------------------------------------------------------
+
+class SystemLibraryGetSystemPathTests(unittest.TestCase):
+    def setUp(self):
+        unreal.reset()
+
+    def test_present_by_default_and_derives_disk_path_from_package_path(self):
+        self.assertTrue(hasattr(unreal, "SystemLibrary"))
+        self.assertTrue(hasattr(unreal.SystemLibrary, "get_system_path"))
+
+        project_disk = os.path.join(tempfile.gettempdir(), "MockProjA")
+        unreal.set_project_disk_dir(project_disk)
+        unreal.add_asset("/Game/Textures/T_Foo", "Texture2D")
+        asset = unreal.EditorAssetLibrary.load_asset("/Game/Textures/T_Foo")
+
+        disk_path = unreal.SystemLibrary.get_system_path(asset)
+
+        expected = os.path.join(project_disk, "Content", "Textures", "T_Foo.uasset")
+        self.assertEqual(disk_path, expected)
+
+    def test_root_level_asset_has_no_subfolder_before_the_filename(self):
+        project_disk = os.path.join(tempfile.gettempdir(), "MockProjB")
+        unreal.set_project_disk_dir(project_disk)
+        unreal.add_asset("/Game/T_Bare", "Texture2D")
+        asset = unreal.EditorAssetLibrary.load_asset("/Game/T_Bare")
+
+        disk_path = unreal.SystemLibrary.get_system_path(asset)
+
+        self.assertEqual(disk_path, os.path.join(project_disk, "Content", "T_Bare.uasset"))
+
+    def test_default_project_disk_dir_is_under_the_system_tempdir(self):
+        state = unreal.get_state()
+        self.assertEqual(
+            state["project_disk_dir"],
+            os.path.join(tempfile.gettempdir(), "MockProj"))
+
+    def test_absent_when_feature_off(self):
+        unreal.reset(features={"system_path": False})
+        # SystemLibrary itself still exists (gated separately by
+        # "collect_garbage") -- only get_system_path is missing.
+        self.assertTrue(hasattr(unreal, "SystemLibrary"))
+        self.assertFalse(hasattr(unreal.SystemLibrary, "get_system_path"))
+
+    def test_entirely_absent_when_collect_garbage_also_off(self):
+        unreal.reset(features={"collect_garbage": False, "system_path": False})
+        self.assertFalse(hasattr(unreal, "SystemLibrary"))
 
 
 if __name__ == "__main__":

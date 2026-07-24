@@ -167,6 +167,38 @@ CONFIG = {
     # support it). Set to False to skip just this one pass without
     # turning on full SAFE_MODE above (which forces it off regardless).
     "FIX_SOFT_REFERENCES": True,
+    # True = after moving an asset your Verse code references by its
+    # folder-qualified name (Asset Reflection -- see the README's
+    # "Fixing Verse references" section), rewrite that reference in your
+    # real .verse source files so the qualified name matches the asset's
+    # new location. Off = leave every .verse file exactly as it is (the
+    # caution about updating Verse code by hand still applies). Python
+    # cannot compile Verse -- always run Build Verse Code in UEFN
+    # afterward to confirm your project still compiles.
+    "FIX_VERSE_REFERENCES": True,
+    # True = also rewrite a BARE root-level Verse reference (a plain name
+    # with no folder qualification at all, like "T_Hex" -- see the
+    # README's "Fixing Verse references" section). A bare name is a
+    # plain word with nothing to distinguish it from an unrelated
+    # identifier that merely happens to match, so it is always flagged
+    # "(bare name - review)" in the preview either way. Set this to
+    # False to SKIP bare-name rewrites entirely (they are listed in the
+    # preview/report as "skipped (bare name - fix manually)" instead, so
+    # you know to handle those by hand) while still rewriting every
+    # qualified (dotted) reference automatically -- the common,
+    # provably-safe case this feature exists for. Ignored when
+    # FIX_VERSE_REFERENCES above is False.
+    "FIX_VERSE_BARE_NAMES": True,
+    # "" = auto-detect this project's real directory from a scanned
+    # asset's on-disk path (unreal.SystemLibrary.get_system_path()) and
+    # look for .verse source files there. Deliberately NOT unreal.Paths.
+    # project_dir() by default -- in UEFN that call resolves to the
+    # Fortnite ENGINE directory, not your project, which used to make this
+    # feature silently scan the wrong folder and find zero real edits. Set
+    # this to a specific folder path (your project's folder, the one
+    # containing your .uefnproject) to skip auto-detection and search
+    # there instead.
+    "VERSE_SEARCH_DIR": "",
     # The deliberate safety switch. Leave this False to only ever preview
     # what would happen -- nothing is changed. Set it to True (and
     # re-run) when you are ready to actually move things. See README.md
@@ -194,6 +226,8 @@ except ImportError:
 import datetime
 import json
 import os
+import re
+import shutil
 import sys
 
 
@@ -1041,7 +1075,619 @@ def build_plan(assets, config, caps):
             "shared": grouping_stats["shared"],
             "loose": grouping_stats["loose"],
         }
+
+    # Verse-side reference fixup (bounty clarification: "no broken
+    # references" also covers Verse-side references -- see the VERSE
+    # REFERENCES section below). Skipped entirely, with zero filesystem
+    # work, when there are no moves at all (nothing could have changed a
+    # Verse ref) or when CONFIG["FIX_VERSE_REFERENCES"] is off.
+    plan["verse_edits"] = []
+    plan["verse_search_dir"] = None
+    plan["verse_files_count"] = 0
+    if config.get("FIX_VERSE_REFERENCES", True):
+        # A handful of real scanned asset package paths (any normal,
+        # non-protected asset works) -- resolve_verse_search_dir() uses
+        # these to auto-detect the real project directory. See its
+        # docstring for why this replaced trusting unreal.Paths.
+        # project_dir() unconditionally (PROVEN BUG: that call returns
+        # the Fortnite engine dir in UEFN, not the user's project).
+        verse_sample_paths = [
+            a["path"] for a in assets if not is_protected_path(a["path"])
+        ][:5]
+        verse_dir = resolve_verse_search_dir(config, sample_asset_paths=verse_sample_paths)
+        verse_files = find_verse_files(verse_dir) if verse_dir else []
+        plan["verse_search_dir"] = verse_dir
+        plan["verse_files_count"] = len(verse_files)
+        if moves and verse_files:
+            plan["verse_edits"] = build_verse_edits(
+                moves, verse_files, all_roots_norm,
+                fix_bare_names=config.get("FIX_VERSE_BARE_NAMES", True))
+
     return plan
+
+
+# =====================================================================
+# === VERSE REFERENCES ===
+# =====================================================================
+# Bounty OP clarification: "no broken references" also covers Verse-side
+# references. Ground truth (Epic's Asset Reflection docs): an exposed
+# asset's Verse reference is its Content-folder path with the content
+# root stripped and "/" replaced by ".". Moving an asset therefore
+# changes its Verse-qualified name, and Epic's asset-move APIs never
+# rewrite Verse SOURCE -- only the asset system's own redirectors (see
+# _CAUTION_VERSE_REFERENCES above, which stays accurate: this section is
+# a SEPARATE mechanism, not a claim that redirectors rewrite Verse code).
+#
+# This section finds every real .verse source file, works out each moved
+# asset's old/new Verse ref, and rewrites every boundary-safe occurrence
+# in place -- backed up first, undoable after. Python cannot COMPILE
+# Verse (that is a UEFN action): this fixup keeps the qualified names
+# correct so a Build Verse Code afterward has a chance to succeed; it can
+# never itself prove the result compiles. See the README's "Fixing Verse
+# references" section.
+
+def content_path_to_verse_ref(content_path, content_roots):
+    """Epic's Asset Reflection rule, exactly: strip the matching content
+    root from `content_path` (an exposed asset's Content-folder package
+    path) and replace every remaining "/" with ".". A root-level asset
+    (nothing left after stripping the root) yields a bare name with no
+    dots at all -- "the subfolder name becomes the name of the Verse
+    module," so a root-level asset simply has no module segment to
+    contribute.
+
+    `content_roots` may hold more than one discovered mount (discover_
+    content_roots() can return several on its fallback path); the FIRST
+    root that is a genuine prefix of `content_path` wins. A trailing "/"
+    on either the root or `content_path` is tolerated. Returns None if
+    `content_path` sits under none of `content_roots`, or equals a root
+    exactly (the root itself is not an asset) -- fail-soft, not an
+    assert; callers treat None as "cannot compute a Verse ref for this,
+    skip it" rather than raising."""
+    path = (content_path or "").rstrip("/")
+    for raw_root in content_roots or []:
+        root = str(raw_root or "").rstrip("/")
+        if not root:
+            continue
+        if path == root:
+            return None
+        prefix = root + "/"
+        if path.startswith(prefix):
+            remainder = path[len(prefix):]
+            if not remainder:
+                return None
+            return ".".join(remainder.split("/"))
+    return None
+
+
+def resolve_verse_search_dir(config, sample_asset_paths=None):
+    """Decide which real directory to walk for .verse source files.
+
+    PROVEN BUG this fixes: a live UEFN diagnostic showed unreal.Paths.
+    project_dir() resolving to the FORTNITE ENGINE directory, not the
+    user's project (the preview line read "Verse fixup: 7 .verse file(s)
+    found under ..\\..\\..\\FortniteGame" -- real .verse files, entirely the
+    wrong project). find_verse_files() then scanned Fortnite's own .verse
+    files and produced zero edits even though the user's real project had
+    a genuine Verse reference to a moved asset.
+
+    This now builds an ORDERED list of candidate directories and returns
+    the FIRST one for which find_verse_files() actually finds something --
+    whichever real directory demonstrably HAS Verse source wins, rather
+    than trusting any single link in the chain blindly. If no candidate
+    has files, the first non-None candidate is returned anyway, so the
+    "Verse fixup: N file(s) found under X" diagnostic still names a real
+    path instead of going blank.
+
+    Candidate order:
+    1. CONFIG["VERSE_SEARCH_DIR"] if set -- trusted as-is, unconditionally,
+       no files check at all. The user said "look here"; honor it, same
+       as always. Short-circuits everything below.
+    2. Derived from `sample_asset_paths` (a handful of real scanned asset
+       package paths -- build_plan()/run_apply() each pass a few
+       non-protected ones): unreal.EditorAssetLibrary.load_asset(path) ->
+       unreal.SystemLibrary.get_system_path(asset) gives a real on-disk
+       path like ".../PremFN_1v1/Content/Textures/T_Foo.uasset"; the
+       project directory is the parent of that path's "Content" segment
+       (see _project_dir_from_asset_disk_path()). This is the reliable
+       UEFN way to find the user's actual project root, and the primary
+       fix for the bug above. Up to 5 sample paths are tried; each is its
+       own hasattr-gated, try/except attempt -- one bad/stale sample never
+       blocks the rest.
+    3. unreal.Paths.project_dir() -- kept only as a low-priority fallback
+       now (this is the call that returns the Fortnite engine dir in
+       UEFN; see the bug above).
+    4. unreal.SystemLibrary.get_project_directory().
+
+    Every optional API is hasattr-gated AND wrapped in its own try/except,
+    same as resolve_log_dir() -- a build (or, in tests, the mock) that
+    simply does not define one of these getters just falls through to the
+    next link.
+
+    Unlike resolve_log_dir(), this deliberately does NOT fall back to the
+    script's own folder or the current working directory when nothing
+    resolves: a log dir must exist somewhere to write to, but there is no
+    safe default folder to blind-walk looking for Verse source, so
+    "nothing resolved at all" fails soft to None -- find_verse_files(None)
+    simply returns no files, and the whole feature quietly no-ops."""
+    raw = config.get("VERSE_SEARCH_DIR", "") or ""
+    if raw:
+        return os.path.normpath(raw)
+
+    candidates = []
+
+    if (unreal is not None and sample_asset_paths
+            and hasattr(unreal, "EditorAssetLibrary")
+            and hasattr(unreal.EditorAssetLibrary, "load_asset")
+            and hasattr(unreal, "SystemLibrary")
+            and hasattr(unreal.SystemLibrary, "get_system_path")):
+        for sample_path in list(sample_asset_paths)[:5]:
+            try:
+                asset_obj = unreal.EditorAssetLibrary.load_asset(sample_path)
+                if asset_obj is None:
+                    continue
+                disk_path = unreal.SystemLibrary.get_system_path(asset_obj)
+                project_dir = _project_dir_from_asset_disk_path(disk_path)
+                if project_dir and project_dir not in candidates:
+                    candidates.append(project_dir)
+            except Exception:
+                continue
+
+    if unreal is not None:
+        try:
+            if hasattr(unreal, "Paths") and hasattr(unreal.Paths, "project_dir"):
+                candidate = unreal.Paths.project_dir()
+                if candidate:
+                    norm = os.path.normpath(str(candidate))
+                    if norm not in candidates:
+                        candidates.append(norm)
+        except Exception:
+            pass
+
+    if unreal is not None:
+        try:
+            if hasattr(unreal, "SystemLibrary") and hasattr(
+                unreal.SystemLibrary, "get_project_directory"
+            ):
+                candidate = unreal.SystemLibrary.get_project_directory()
+                if candidate:
+                    norm = os.path.normpath(str(candidate))
+                    if norm not in candidates:
+                        candidates.append(norm)
+        except Exception:
+            pass
+
+    if not candidates:
+        return None
+
+    for candidate in candidates:
+        if find_verse_files(candidate):
+            return candidate
+
+    return candidates[0]
+
+
+def _project_dir_from_asset_disk_path(disk_path):
+    """Given a real on-disk asset path (as unreal.SystemLibrary.
+    get_system_path() returns, e.g. ".../PremFN_1v1/Content/Textures/
+    T_Foo.uasset"), return the project directory: the parent of the
+    nearest path segment literally named "Content". Every UEFN/UE asset
+    lives under exactly one project's Content folder, so this is the
+    reliable inverse of "where does this asset's project live on disk".
+
+    Fail-soft: returns None (never raises) if `disk_path` is falsy or has
+    no "Content" segment with anything above it."""
+    if not disk_path:
+        return None
+    try:
+        norm = os.path.normpath(str(disk_path))
+        parts = norm.split(os.sep)
+        for i, part in enumerate(parts):
+            if part == "Content" and i > 0:
+                return os.sep.join(parts[:i])
+    except Exception:
+        return None
+    return None
+
+
+# Path segments that mark a location never worth searching for real Verse
+# source: engine-regenerated/VCS/build bookkeeping folders. os.walk()
+# prunes its own `dirs` list against this set on every iteration, so a
+# match at ANY depth stops that whole subtree from being descended into,
+# not just an immediate child of `project_dir`.
+_VERSE_EXCLUDE_DIR_SEGMENTS = {
+    "Intermediate", "Saved", "Build", "DerivedDataCache", ".git",
+    "__ExternalActors__", "__ExternalObjects__",
+}
+
+
+def find_verse_files(project_dir):
+    """Walk `project_dir` for every real Verse source file (*.verse),
+    using NORMAL Python file I/O -- these are text SOURCE files, not
+    `unreal`-managed assets, so the unreal-only access rule elsewhere in
+    this file does not apply here. Excludes *.digest.verse (Assets.
+    digest.verse and similar -- auto-generated by UEFN itself, NEVER
+    hand-edited and never a real reference source) and anything under a
+    path segment in _VERSE_EXCLUDE_DIR_SEGMENTS. Returns absolute paths.
+
+    Fail-soft: a falsy/missing/unwalkable `project_dir` returns []
+    rather than raising."""
+    if not project_dir:
+        return []
+    results = []
+    try:
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in _VERSE_EXCLUDE_DIR_SEGMENTS]
+            for name in files:
+                lowered = name.lower()
+                if not lowered.endswith(".verse"):
+                    continue
+                if lowered.endswith(".digest.verse"):
+                    continue
+                results.append(os.path.abspath(os.path.join(root, name)))
+    except Exception:
+        return results
+    return results
+
+
+def _verse_ref_pattern(old_ref):
+    """Compile the boundary-safe regex shared by every Verse-source
+    replacement this file makes -- both dotted asset references
+    (PowersWheelAssets.Models.Textures.T_Hex) and using-statement folder
+    paths (/PremFN_1v1/PowersWheelAssets/Models/Textures) alike, since
+    the same rule works for both: a match must not be immediately
+    preceded by a word character or a "." (so a shorter ref is never
+    replaced as the tail fragment of a longer qualified name -- "A.B.
+    T_Hex" does not match inside "X.A.B.T_Hex") and must not be
+    immediately followed by a word character (so "T_Hex" never matches
+    inside "T_Hex2"). "/" is not a word character, so this same rule also
+    correctly bounds a slash-form folder path with no special casing."""
+    return re.compile(r"(?<![\w.])" + re.escape(old_ref) + r"(?![\w])")
+
+
+# using { /Some/Folder/Path } -- captures the path text between the
+# braces (non-whitespace, backtracks past a trailing "}").
+_USING_STATEMENT_RE = re.compile(r"using\s*\{\s*(\S+?)\s*\}")
+
+
+def build_verse_edits(plan_moves, verse_files, content_roots, fix_bare_names=True):
+    """Compute every Verse-source edit needed to keep `.verse` code
+    compiling after `plan_moves` relocates assets referenced by folder-
+    qualified name (Asset Reflection). `plan_moves` is build_plan()'s
+    moves list (dicts with at least "path"/"dest_path", optionally
+    "dest_folder") -- or execute_plan()'s actually-moved pairs, normalized
+    to the same {"path": old, "dest_path": new} shape by the caller (see
+    run_apply()).
+
+    Returns a list of edits: {"file", "line_no", "old_line", "new_line",
+    "old_ref", "new_ref", "is_bare", "count", "kind", "skipped"} -- one
+    entry per (file, line, old_ref) triple where at least one boundary-
+    safe occurrence of that ref was found. "is_bare" is True whenever
+    old_ref has no "." (a root-level asset name, or -- structurally
+    dot-free the same way -- a using-statement's slash path); "kind"
+    tells the two apart for display purposes ("ref" for a plain dotted
+    asset reference, "using" for a whole-folder using-statement rewrite)
+    -- see format_verse_preview(), which only flags the former as the
+    riskier case worth a manual look.
+
+    `fix_bare_names` (CONFIG["FIX_VERSE_BARE_NAMES"], default True) gates
+    ONLY a bare "ref"-kind entry -- a using-statement edit is a
+    different, already-conservative category (gated by the folder-
+    agreement rule below, not by its dot count) and is never affected by
+    this flag regardless of how many dots its own old_ref happens to
+    have. When False, a bare ref match is still FOUND (so the user can
+    see and fix it manually) but marked "skipped": True and left
+    UNCHANGED in "new_line" -- apply_verse_edits() never writes a
+    skipped entry to disk. Every other entry always has "skipped": False.
+
+    Every replacement is boundary-safe (_verse_ref_pattern) -- never a
+    naive substring replace. A move whose old and new Verse ref come out
+    identical (most commonly a no-op {"path": x, "dest_path": x} pair)
+    contributes no edit.
+
+    using-statement rewriting is deliberately conservative: a folder-
+    level old->new mapping is only derived when EVERY move sharing that
+    old folder agrees on the very same new folder; a folder whose
+    contents scattered to two or more destinations in this run is left
+    out entirely rather than guessed at. Even then, a using-line is only
+    ever rewritten when the path captured between its braces EXACTLY
+    equals a mapped old folder (trailing "/" tolerated) -- this never
+    touches a comment or string that merely happens to contain the same
+    text elsewhere on the line.
+
+    Every .verse file is read with normal Python text I/O; a single
+    unreadable file is skipped (fail-soft) rather than aborting the
+    whole scan."""
+    edits = []
+
+    ref_pairs = []
+    for m in plan_moves:
+        old_path = m.get("path")
+        new_path = m.get("dest_path")
+        if not old_path or not new_path:
+            continue
+        old_ref = content_path_to_verse_ref(old_path, content_roots)
+        new_ref = content_path_to_verse_ref(new_path, content_roots)
+        if not old_ref or not new_ref or old_ref == new_ref:
+            continue
+        ref_pairs.append((old_ref, new_ref))
+
+    folder_candidates = {}
+    for m in plan_moves:
+        old_path = m.get("path")
+        if not old_path or "/" not in old_path:
+            continue
+        old_folder = old_path.rsplit("/", 1)[0]
+        dest_path = m.get("dest_path") or ""
+        new_folder = m.get("dest_folder") or (
+            dest_path.rsplit("/", 1)[0] if "/" in dest_path else "")
+        if not new_folder or old_folder == new_folder:
+            continue
+        folder_candidates.setdefault(old_folder, set()).add(new_folder)
+    folder_pairs = [
+        (old_folder, next(iter(new_folders)))
+        for old_folder, new_folders in folder_candidates.items()
+        if len(new_folders) == 1
+    ]
+
+    if not ref_pairs and not folder_pairs:
+        return edits
+
+    for file_path in verse_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+
+        for line_no, raw_line in enumerate(lines, start=1):
+            line = raw_line.rstrip("\r\n")
+
+            for old_ref, new_ref in ref_pairs:
+                is_bare = "." not in old_ref
+                pattern = _verse_ref_pattern(old_ref)
+                if is_bare and not fix_bare_names:
+                    # Found, but deliberately left unrewritten -- listed
+                    # as "skipped (bare name - fix manually)" so the user
+                    # knows to handle it by hand instead of it silently
+                    # vanishing from the preview/report.
+                    count = len(pattern.findall(line))
+                    if count:
+                        edits.append({
+                            "file": file_path, "line_no": line_no,
+                            "old_line": line, "new_line": line,
+                            "old_ref": old_ref, "new_ref": new_ref,
+                            "is_bare": True, "count": count,
+                            "kind": "ref", "skipped": True,
+                        })
+                    continue
+                new_line, count = pattern.subn(new_ref, line)
+                if count:
+                    edits.append({
+                        "file": file_path, "line_no": line_no,
+                        "old_line": line, "new_line": new_line,
+                        "old_ref": old_ref, "new_ref": new_ref,
+                        "is_bare": is_bare, "count": count,
+                        "kind": "ref", "skipped": False,
+                    })
+
+            if folder_pairs:
+                using_match = _USING_STATEMENT_RE.search(line)
+                if using_match:
+                    used_path = using_match.group(1).rstrip("/")
+                    for old_folder, new_folder in folder_pairs:
+                        if used_path != old_folder:
+                            continue
+                        pattern = _verse_ref_pattern(old_folder)
+                        new_line, count = pattern.subn(new_folder, line)
+                        if count:
+                            edits.append({
+                                "file": file_path, "line_no": line_no,
+                                "old_line": line, "new_line": new_line,
+                                "old_ref": old_folder, "new_ref": new_folder,
+                                "is_bare": "." not in old_folder,
+                                "count": count, "kind": "using",
+                                "skipped": False,
+                            })
+
+    return edits
+
+
+def format_verse_preview(edits):
+    """Render `edits` (build_verse_edits()'s output) as ASCII lines,
+    grouped by file, each row showing the line number and old_ref ->
+    new_ref. A bare (dot-free) plain reference -- a root-level asset name
+    with no module qualification -- gets a " (bare name - review)"
+    suffix: it is inherently more likely to collide with an unrelated
+    identifier that merely happens to share it, so it is flagged for a
+    manual look even though the boundary-safe regex already guards
+    against a partial-token false match. A using-statement folder-path
+    edit is never flagged this way even though a folder path also has no
+    "." -- it is a different, already-conservative rewrite (see build_
+    verse_edits' docstring), not a short bare identifier.
+
+    An entry build_verse_edits() marked "skipped": True (CONFIG
+    ["FIX_VERSE_BARE_NAMES"] = False, a bare ref found but deliberately
+    left unrewritten) is listed SEPARATELY, under its own "skipped (bare
+    name - fix manually): N" heading, so it is never confused with an
+    edit that will actually happen but is still visible enough that it
+    does not just silently vanish. Returns [] (nothing to print) when
+    `edits` is empty."""
+    lines = []
+    real_edits = [e for e in edits if not e.get("skipped")]
+    skipped_bare = [e for e in edits if e.get("skipped")]
+    if not real_edits and not skipped_bare:
+        return lines
+
+    def _grouped_by_file(entries):
+        by_file = {}
+        file_order = []
+        for e in entries:
+            f = e["file"]
+            if f not in by_file:
+                by_file[f] = []
+                file_order.append(f)
+            by_file[f].append(e)
+        return file_order, by_file
+
+    if real_edits:
+        lines.append("-- Verse reference edits (%d) --" % len(real_edits))
+        file_order, by_file = _grouped_by_file(real_edits)
+        for f in file_order:
+            lines.append("  %s" % f)
+            for e in by_file[f]:
+                suffix = ""
+                if e.get("is_bare") and e.get("kind", "ref") == "ref":
+                    suffix = " (bare name - review)"
+                lines.append("    line %d: %s -> %s%s" % (
+                    e["line_no"], e["old_ref"], e["new_ref"], suffix))
+
+    if skipped_bare:
+        lines.append("skipped (bare name - fix manually): %d" % len(skipped_bare))
+        file_order, by_file = _grouped_by_file(skipped_bare)
+        for f in file_order:
+            lines.append("  %s" % f)
+            for e in by_file[f]:
+                lines.append("    line %d: %s (would become: %s)" % (
+                    e["line_no"], e["old_ref"], e["new_ref"]))
+
+    return lines
+
+
+def _verse_backup_path(backup_dir, file_path):
+    """Map a real .verse file's absolute path to a unique, collision-free
+    backup filename under `backup_dir`: the drive letter (if any) and
+    every path separator are folded into one "_"-joined component, so two
+    files that only differ by folder (or drive) can never collide the
+    way two bare basenames could."""
+    norm = os.path.normpath(file_path)
+    drive, rest = os.path.splitdrive(norm)
+    rest = rest.replace("\\", "/").strip("/")
+    safe = rest.replace("/", "_")
+    if drive:
+        safe = drive.rstrip(":") + "_" + safe
+    return os.path.join(backup_dir, safe or "verse_file")
+
+
+def apply_verse_edits(edits, log_dir):
+    """Apply every collected Verse-reference edit (build_verse_edits()'s
+    output) to the real .verse files on disk. BEFORE touching a file,
+    copies it to a backup under `<log_dir>/verse_backup_<ts>/` and
+    records {original_path: backup_path} in a freshly written sortilege_
+    verse_undo_<ts>.json alongside it (same `ts`, so the two always pair
+    up) -- see undo_verse_edits(). All edits for one file are applied
+    TOGETHER, line-index by line-index, against that file's CURRENT
+    on-disk content (read fresh here, never a stale snapshot a caller
+    might be holding from preview time), so two edits landing on the same
+    line both take effect correctly instead of one clobbering the
+    other's precomputed "new_line" text.
+
+    Every file is its own try/except -- fail-soft, one bad file (missing,
+    permission error, whatever) never aborts the rest of the batch; it is
+    recorded in "failed" instead. Written back with encoding="utf-8" via
+    the same temp-file + os.replace() atomic-write pattern every other
+    writer in this file uses.
+
+    Returns {"edited": [files], "failed": [(file, err)], "backup_index":
+    path_or_None}. `edits` empty -- or holding ONLY entries build_verse_
+    edits() marked "skipped": True (CONFIG["FIX_VERSE_BARE_NAMES"] =
+    False) -- is a clean no-op: no backup folder, no index file, no file
+    ever opened for writing, "backup_index" is None."""
+    edited = []
+    failed = []
+    real_edits = [e for e in edits if not e.get("skipped")]
+    if not real_edits:
+        return {"edited": edited, "failed": failed, "backup_index": None}
+
+    by_file = {}
+    file_order = []
+    for e in real_edits:
+        f = e["file"]
+        if f not in by_file:
+            by_file[f] = []
+            file_order.append(f)
+        by_file[f].append(e)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = os.path.join(log_dir, "verse_backup_%s" % ts)
+    backups = {}
+
+    for file_path in file_order:
+        file_edits = by_file[file_path]
+        try:
+            if not os.path.isdir(backup_dir):
+                os.makedirs(backup_dir)
+            backup_path = _verse_backup_path(backup_dir, file_path)
+            backup_parent = os.path.dirname(backup_path)
+            if backup_parent and not os.path.isdir(backup_parent):
+                os.makedirs(backup_parent)
+            shutil.copy2(file_path, backup_path)
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                current_lines = f.readlines()
+
+            for e in file_edits:
+                idx = e["line_no"] - 1
+                if idx < 0 or idx >= len(current_lines):
+                    continue
+                pattern = _verse_ref_pattern(e["old_ref"])
+                current_lines[idx] = pattern.sub(e["new_ref"], current_lines[idx])
+
+            tmp_path = file_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.writelines(current_lines)
+            os.replace(tmp_path, file_path)
+
+            backups[file_path] = backup_path
+            edited.append(file_path)
+        except Exception as exc:
+            failed.append((file_path, str(exc)))
+
+    index_path = None
+    if backups:
+        index_path = os.path.join(log_dir, "sortilege_verse_undo_%s.json" % ts)
+        data = {"version": 1, "created": ts, "backups": backups}
+        try:
+            tmp_path = index_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, index_path)
+        except Exception:
+            index_path = None
+
+    return {"edited": edited, "failed": failed, "backup_index": index_path}
+
+
+def undo_verse_edits(backup_index_path):
+    """Restore every .verse file recorded in `backup_index_path` (an
+    apply_verse_edits()-written sortilege_verse_undo_<ts>.json) from its
+    backup copy. Returns {"restored": [files], "failed": [(file, err)]}.
+
+    Fail-soft, same contract as load_undo_log(): a missing/unreadable
+    index (or a falsy path) returns both lists empty rather than raising.
+    Each file's restore is its own try/except -- one bad file never
+    aborts the rest of the batch."""
+    restored = []
+    failed = []
+    if not backup_index_path:
+        return {"restored": restored, "failed": failed}
+
+    try:
+        with open(backup_index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        _console_warning(
+            "Sortilege: could not read Verse backup index %s (%s)." % (
+                backup_index_path, exc))
+        return {"restored": restored, "failed": failed}
+
+    for original_path, backup_path in data.get("backups", {}).items():
+        try:
+            shutil.copy2(backup_path, original_path)
+            restored.append(original_path)
+        except Exception as exc:
+            failed.append((original_path, str(exc)))
+
+    return {"restored": restored, "failed": failed}
 
 
 # =====================================================================
@@ -1171,6 +1817,27 @@ def format_preview(plan):
         lines.append("Grouping: by asset (%d kits, %d shared, %d loose)" % (
             grouping.get("kits", 0), grouping.get("shared", 0),
             grouping.get("loose", 0)))
+    verse_edits = plan.get("verse_edits") or []
+    verse_real_edit_count = len([e for e in verse_edits if not e.get("skipped")])
+    verse_skipped_bare_count = len([e for e in verse_edits if e.get("skipped")])
+    if verse_real_edit_count:
+        lines.append("Verse reference edits proposed: %d" % verse_real_edit_count)
+    if verse_skipped_bare_count:
+        lines.append(
+            "Verse bare-name edits skipped (fix manually): %d" % verse_skipped_bare_count)
+    # Always report where the Verse scan looked and how many .verse files it
+    # found -- otherwise "0 Verse edits" is ambiguous between "wrong search
+    # directory, found nothing" and "found the files, nothing referenced a
+    # moved asset". Fastest field diagnostic for the Verse fixup.
+    _vdir = plan.get("verse_search_dir")
+    _vcount = plan.get("verse_files_count", 0)
+    if _vdir:
+        lines.append("Verse fixup: %d .verse file(s) found under %s" % (_vcount, _vdir))
+    else:
+        lines.append(
+            "Verse fixup: NO .verse search directory resolved -- set "
+            "VERSE_SEARCH_DIR in CONFIG to your UEFN project folder "
+            "(the one containing your .uefnproject).")
     # Deep grouped chains can push destination paths past what some
     # platforms/tools move reliably. Purely a preview warning -- the
     # executor's per-item failure handling already covers any actual
@@ -1218,6 +1885,10 @@ def format_preview(plan):
             lines.append("  %s (%d):" % (reason, len(items)))
             for s in items:
                 lines.append("    %s [%s]" % (_truncate_middle(s["path"]), s["class_name"]))
+        lines.append("")
+
+    if verse_edits:
+        lines.extend(format_verse_preview(verse_edits))
         lines.append("")
 
     lines.append("-" * 70)
@@ -1285,6 +1956,33 @@ def plan_to_skip_rows(plan):
                 "class_name": s["class_name"],
                 "path": s["path"],
             })
+    return rows
+
+
+def plan_to_verse_edit_rows(plan):
+    """Flatten plan["verse_edits"] (build_verse_edits()'s output, as
+    attached by build_plan()) into GUI-table rows: one dict per entry
+    with "file", "line_no", "old_ref", "new_ref", "note" -- the exact
+    same distinction the console's format_verse_preview() draws, just
+    reshaped for a Treeview instead of ASCII lines. "note" is "bare name
+    - review" for a real (non-skipped) bare plain reference, "skipped -
+    fix manually" for an entry build_verse_edits() left unrewritten under
+    CONFIG["FIX_VERSE_BARE_NAMES"] = False, or "" otherwise (a qualified
+    reference, or any using-statement folder-path edit -- never flagged
+    bare regardless of its own dot count, same reasoning as format_
+    verse_preview())."""
+    rows = []
+    for e in plan.get("verse_edits", []) or []:
+        if e.get("skipped"):
+            note = "skipped - fix manually"
+        elif e.get("is_bare") and e.get("kind", "ref") == "ref":
+            note = "bare name - review"
+        else:
+            note = ""
+        rows.append({
+            "file": e["file"], "line_no": e["line_no"],
+            "old_ref": e["old_ref"], "new_ref": e["new_ref"], "note": note,
+        })
     return rows
 
 
@@ -1454,6 +2152,26 @@ def write_summary(plan, results, log_dir):
             results.get("pre_restore_cleanup")))
     lines.append("Redirector cleanup: %s" % _format_redirector_cleanup(
         results.get("redirector_cleanup")))
+    verse_edits = results.get("verse_edits")
+    if verse_edits is not None:
+        lines.append(
+            "Verse references rewritten: %d edit(s) across %d file(s), "
+            "%d failed" % (
+                verse_edits.get("edit_count", 0),
+                len(verse_edits.get("edited", [])),
+                len(verse_edits.get("failed", [])),
+            ))
+        skipped_bare_count = verse_edits.get("skipped_bare_count", 0)
+        if skipped_bare_count:
+            lines.append(
+                "Verse bare-name edits skipped (fix manually): %d" % skipped_bare_count)
+    verse_undo = results.get("verse_undo")
+    if verse_undo is not None:
+        lines.append(
+            "Verse references restored: %d file(s), %d failed" % (
+                len(verse_undo.get("restored", [])),
+                len(verse_undo.get("failed", [])),
+            ))
     empty_folders = results.get("empty_folders")
     if empty_folders is not None:
         removed_folders = empty_folders.get("removed", [])
@@ -1495,10 +2213,11 @@ class UndoLog:
     directly. `.path` is the file it's writing to; `.record(old, new)`
     appends one move and rewrites the file on every call."""
 
-    def __init__(self, path, created, moves):
+    def __init__(self, path, created, moves, verse_backup_index=None):
         self.path = path
         self.created = created
         self.moves = moves
+        self.verse_backup_index = verse_backup_index
 
     @classmethod
     def begin(cls, log_dir, plan):
@@ -1516,6 +2235,15 @@ class UndoLog:
         self.moves.append({"from": old_path, "to": new_path})
         self._write()
 
+    def set_verse_backup_index(self, path):
+        """Record the path to this run's Verse-edit backup index (see
+        apply_verse_edits()) so a LATER undo -- which only ever receives
+        THIS file's own path, not the run's live results dict -- can find
+        and restore the paired .verse backups too (see run_undo()).
+        Rewrites the file immediately, same as record()."""
+        self.verse_backup_index = path
+        self._write()
+
     def _write(self):
         """Write the whole undo record atomically: a crash (or, as
         exercised in tests, a raised exception) partway through the dump
@@ -1526,7 +2254,8 @@ class UndoLog:
         rename, so self.path only ever flips between its previous
         complete content and its new complete content, never a partial
         write."""
-        data = {"version": 1, "created": self.created, "moves": self.moves}
+        data = {"version": 1, "created": self.created, "moves": self.moves,
+                 "verse_backup_index": self.verse_backup_index}
         tmp_path = self.path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -2651,6 +3380,24 @@ def run_undo(undo_log_path, caps, echo_preview=True, status_callback=None):
             len(results["redirector_cleanup"]["fixed"]),
             len(results["redirector_cleanup"]["remaining"])))
 
+    # Mirrors run_apply()'s verse-references stage, but data-dependent
+    # rather than CONFIG-dependent: whether THIS run's original apply
+    # ever produced a Verse backup to restore is a fact recorded in the
+    # undo log itself (data["verse_backup_index"]), not something an
+    # undo-time CONFIG flag could sensibly gate -- there is nothing to
+    # restore if the original apply never touched a .verse file. SAFE_
+    # MODE still forces it off regardless, same skip-mark convention as
+    # pre-restore-cleanup above.
+    verse_backup_index = data.get("verse_backup_index")
+    if safe_mode:
+        tracer.mark("SAFE_MODE active: skipping verse-undo")
+    elif verse_backup_index:
+        _status("Restoring Verse references...")
+        tracer.mark("STAGE >>> entering: verse-undo")
+        results["verse_undo"] = undo_verse_edits(verse_backup_index)
+        tracer.mark("STAGE <<< done: verse-undo (restored=%d failed=%d)" % (
+            len(results["verse_undo"]["restored"]), len(results["verse_undo"]["failed"])))
+
     # Sweep the sorted folders the restore just vacated (the reversal
     # plan's SOURCE folders), after redirector cleanup for the same
     # reason as run_apply(): a folder holding only a leftover redirector
@@ -3211,6 +3958,44 @@ def run_apply(plan, caps, extra_progress=None, status_callback=None):
             len(results["redirector_cleanup"]["fixed"]),
             len(results["redirector_cleanup"]["remaining"])))
 
+    # AFTER the asset moves + redirector cleanup succeed (bounty
+    # clarification: "no broken references" also covers Verse-side
+    # references -- see build_verse_edits()'s docstring). Gated the same
+    # way as every other optional post-move pass: SAFE_MODE forces it off
+    # regardless of CONFIG, the same "just move the assets, nothing else"
+    # bisect valve as soft-references/redirector-cleanup/empty-folder-
+    # sweep. Built from results["moved"] -- the ACTUALLY-moved pairs, not
+    # the full plan -- so a partially-failed batch only ever rewrites
+    # Verse refs for assets that genuinely ended up at their new path.
+    do_verse_fix = CONFIG.get("FIX_VERSE_REFERENCES", True) and not safe_mode
+    if safe_mode:
+        tracer.mark("SAFE_MODE active: skipping verse-references")
+    if do_verse_fix:
+        _status("Rewriting Verse references...")
+        tracer.mark("STAGE >>> entering: verse-references")
+        moved_as_moves = [{"path": old, "dest_path": new}
+                          for old, new in results.get("moved", [])]
+        # Sample from the NEW (post-move) paths -- they are real,
+        # existing assets right now, unlike the old paths (redirectors).
+        # Same auto-detect mechanism build_plan() uses; see
+        # resolve_verse_search_dir()'s docstring.
+        verse_sample_paths = [mv["dest_path"] for mv in moved_as_moves][:5]
+        verse_dir = resolve_verse_search_dir(CONFIG, sample_asset_paths=verse_sample_paths)
+        verse_files = find_verse_files(verse_dir)
+        verse_edit_list = build_verse_edits(
+            moved_as_moves, verse_files, discover_content_roots(),
+            fix_bare_names=CONFIG.get("FIX_VERSE_BARE_NAMES", True))
+        verse_apply_result = apply_verse_edits(verse_edit_list, log_dir)
+        verse_apply_result["edit_count"] = len(
+            [e for e in verse_edit_list if not e.get("skipped")])
+        verse_apply_result["skipped_bare_count"] = len(
+            [e for e in verse_edit_list if e.get("skipped")])
+        results["verse_edits"] = verse_apply_result
+        if verse_apply_result.get("backup_index"):
+            undo_log.set_verse_backup_index(verse_apply_result["backup_index"])
+        tracer.mark("STAGE <<< done: verse-references (edited=%d failed=%d)" % (
+            len(verse_apply_result["edited"]), len(verse_apply_result["failed"])))
+
     # AFTER redirector cleanup on purpose: a folder holding only a
     # leftover redirector reads non-empty until that redirector is
     # cleaned, so sweeping first would keep folders the cleanup was
@@ -3460,9 +4245,11 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
 
     moves_frame = ttk.Frame(notebook)
     skips_frame = ttk.Frame(notebook)
+    verse_frame = ttk.Frame(notebook)
     mapping_frame = ttk.Frame(notebook)
     notebook.add(moves_frame, text="Planned moves")
     notebook.add(skips_frame, text="Skipped")
+    notebook.add(verse_frame, text="Verse edits")
     notebook.add(mapping_frame, text="Folder mapping")
 
     moves_tree = ttk.Treeview(
@@ -3486,6 +4273,28 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
     skips_tree.pack(side="left", fill="both", expand=True)
     skips_scroll.pack(side="right", fill="y")
 
+    # "Verse edits" tab: the console preview's "-- Verse reference edits
+    # --" section (see format_verse_preview()), shown in the window too --
+    # review Minor: the Output Log was the only place a Verse edit was
+    # ever visible before this. Populated (and re-populated on Re-scan)
+    # from the SAME plan["verse_edits"] list build_plan() attaches, via
+    # plan_to_verse_edit_rows() -- one row per proposed edit, "note"
+    # holding the same "bare name - review" / "skipped - fix manually"
+    # flag the console draws.
+    verse_tree = ttk.Treeview(
+        verse_frame, columns=("file", "line", "old_ref", "new_ref", "note"),
+        show="headings")
+    for key, label, width in (
+        ("file", "File", 220), ("line", "Line", 50), ("old_ref", "Old ref", 180),
+        ("new_ref", "New ref", 180), ("note", "Note", 160),
+    ):
+        verse_tree.heading(key, text=label)
+        verse_tree.column(key, width=width, anchor="w")
+    verse_scroll = ttk.Scrollbar(verse_frame, orient="vertical", command=verse_tree.yview)
+    verse_tree.configure(yscrollcommand=verse_scroll.set)
+    verse_tree.pack(side="left", fill="both", expand=True)
+    verse_scroll.pack(side="right", fill="y")
+
     def _refresh_tables():
         try:
             for item in moves_tree.get_children():
@@ -3505,6 +4314,17 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
         for row in plan_to_skip_rows(state["plan"]):
             skips_tree.insert(
                 "", "end", values=(row["reason"], row["class_name"], row["path"]))
+
+        try:
+            for item in verse_tree.get_children():
+                verse_tree.delete(item)
+        except Exception:
+            pass
+        for row in plan_to_verse_edit_rows(state["plan"]):
+            verse_tree.insert(
+                "", "end",
+                values=(row["file"], row["line_no"], row["old_ref"],
+                         row["new_ref"], row["note"]))
 
     # --- Folder mapping tab ---
     mapping_error_var = tk.StringVar(master=root, value="")
@@ -3798,8 +4618,8 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
         state["poll_id"] = None
 
     all_controls = (
-        [moves_tree, skips_tree, rescan_button, apply_checkbox, apply_button, close_button,
-         safe_mode_checkbox]
+        [moves_tree, skips_tree, verse_tree, rescan_button, apply_checkbox, apply_button,
+         close_button, safe_mode_checkbox]
         + list(mapping_entries.values()) + [sort_root_entry]
     )
 
@@ -3878,6 +4698,10 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
         if broken_soft_refs:
             summary_text += ", %d BROKEN soft reference%s (see report)" % (
                 broken_soft_refs, "" if broken_soft_refs == 1 else "s")
+        verse_edit_count = (results.get("verse_edits") or {}).get("edit_count", 0)
+        if verse_edit_count:
+            summary_text += ", %d Verse reference%s updated" % (
+                verse_edit_count, "" if verse_edit_count == 1 else "s")
         summary_text += " - full report: %s" % outcome["report_path"]
 
         result_var = tk.StringVar(master=root)
@@ -4010,6 +4834,7 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
         "safe_mode_checkbox": safe_mode_checkbox,
         "status_var": status_var,
         "logs_var": logs_var,
+        "verse_tree": verse_tree,
         "on_apply": _on_apply,
         "on_rescan": _on_rescan,
         "on_close": _on_close,

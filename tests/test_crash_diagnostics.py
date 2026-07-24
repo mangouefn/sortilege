@@ -162,7 +162,7 @@ class RunApplyStageTraceTests(unittest.TestCase):
             n for n in os.listdir(self.tmp_dir)
             if n.startswith("sortilege_trace_") and n.endswith(".log"))
 
-    def test_full_apply_writes_all_six_stage_pairs_in_strict_order(self):
+    def test_full_apply_writes_all_seven_stage_pairs_in_strict_order(self):
         mock_unreal.add_asset("/Game/Stuff/Rock", "StaticMesh")
         assets = [asset("/Game/Stuff/Rock", "StaticMesh")]
         caps = self.sortilege.probe_capabilities()
@@ -176,9 +176,12 @@ class RunApplyStageTraceTests(unittest.TestCase):
             lines = [l for l in f.read().splitlines() if l]
         stage_lines = [l for l in lines if l.startswith("STAGE ")]
 
+        # "verse-references" is new: it always runs right after
+        # redirector cleanup, before the empty-folder sweep -- see
+        # run_apply()'s docstring.
         expected_stage_order = [
             "moves", "soft-references", "redirector-cleanup",
-            "empty-folder-sweep", "verify", "write-summary",
+            "verse-references", "empty-folder-sweep", "verify", "write-summary",
         ]
         expected_fragments = []
         for name in expected_stage_order:

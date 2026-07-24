@@ -493,6 +493,31 @@ class _FakeEntry(_FakeWidget):
         self._text = ""
 
 
+class _FakeTreeview(_FakeWidget):
+    """Unlike the generic _FakeWidget (whose insert()/get_children() are
+    inert no-ops), this tracks every insert()'s `values` tuple in order
+    -- lets tests verify a Treeview's actual populated content, not just
+    that construction/wiring didn't crash. delete() always clears
+    everything regardless of which item id(s) it's called with, which is
+    behaviorally equivalent here: every real caller in this file always
+    walks get_children() and deletes every item before repopulating (see
+    _refresh_tables()), never a single selective delete."""
+
+    def __init__(self, *args, **kwargs):
+        _FakeWidget.__init__(self, *args, **kwargs)
+        self.inserted_rows = []
+
+    def insert(self, parent, index, values=None, **kwargs):
+        self.inserted_rows.append(values)
+        return None
+
+    def get_children(self):
+        return list(range(len(self.inserted_rows)))
+
+    def delete(self, *args, **kwargs):
+        self.inserted_rows = []
+
+
 class _FakeBooleanVar(object):
     def __init__(self, master=None, value=False):
         self._master = master
@@ -627,7 +652,7 @@ def _make_fake_ttk_module():
     fake_ttk = type("FakeTtkModule", (object,), {})
     fake_ttk.Notebook = _FakeWidget
     fake_ttk.Frame = _FakeWidget
-    fake_ttk.Treeview = _FakeWidget
+    fake_ttk.Treeview = _FakeTreeview
     fake_ttk.Scrollbar = _FakeWidget
     fake_ttk.Button = _FakeWidget
     fake_ttk.Label = _FakeWidget

@@ -15,11 +15,19 @@ depends on, including the semantics that matter for reference-safe moves:
 - Optional-API surfaces (``EditorDialog``, ``ScopedSlowTask``,
   ``AssetRenameData``, ``EditorUtilityLibrary.get_selected_folder_paths``,
   ``AssetTools.fix_up_redirectors``, ``AssetData.asset_class_path``,
-  ``SystemLibrary.collect_garbage``,
+  ``SystemLibrary.collect_garbage``, ``SystemLibrary.get_system_path``,
   ``AssetTools.rename_referencing_soft_object_paths``) are genuinely
   ABSENT (not None) when their feature switch is off, exactly like a UEFN
   build missing that API from its Python whitelist. The tool under test
   gates on these with ``hasattr``.
+- ``SystemLibrary.get_system_path(asset)`` derives a fake but realistic
+  on-disk path from an asset's package path, rooted under a settable
+  module-level fake project disk directory (``set_project_disk_dir()``) --
+  models the real UEFN API sortilege.py uses to auto-detect the user's
+  actual project directory (see resolve_verse_search_dir() in
+  sortilege.py). Gated behind its own "system_path" feature switch
+  (default True), independent of "collect_garbage" (which still gates
+  whether ``SystemLibrary`` exists on the module at all).
 - ``EditorAssetLibrary.rename_asset`` accepts EITHER a package path or a
   full object path ("...Name.Name") for both source and destination, like
   the real API. ``AssetData.is_redirector()``/``.get_asset()`` are always
@@ -58,6 +66,7 @@ _DEFAULT_FEATURES = {
     "collect_garbage": True,
     "soft_path_rename": True,
     "dependency_query": True,
+    "system_path": True,
 }
 
 _PROTECTED_MOVE_CLASSES = {
@@ -690,11 +699,38 @@ class _SystemLibraryImpl:
     same as every other optional-capability class in this mock. Note this
     intentionally does NOT define get_project_saved_directory(): that
     absence is what exercises resolve_log_dir()'s fall-through to
-    unreal.Paths.project_saved_dir() in tests/test_preview_logs.py."""
+    unreal.Paths.project_saved_dir() in tests/test_preview_logs.py. Also
+    intentionally never defines get_project_directory() -- resolve_verse_
+    search_dir()'s own fall-through chain in test_verse_references.py
+    depends on that absence too.
+
+    get_system_path() is attached separately, gated by its OWN
+    "system_path" feature switch (see _apply_feature_gates) -- independent
+    of "collect_garbage" so a test can turn one off without the other."""
 
     @staticmethod
     def collect_garbage():
         _state["gc_calls"] = _state.get("gc_calls", 0) + 1
+
+
+def _get_system_path_impl(obj):
+    """Mirrors unreal.SystemLibrary.get_system_path(): given an asset
+    object (as EditorAssetLibrary.load_asset() returns -- a FakeAsset
+    whose `.path` is its resolved package path), derive a fake but
+    realistic on-disk path rooted under the settable module-level fake
+    project disk directory (see set_project_disk_dir()) -- e.g. package
+    "/Game/Textures/T_Foo" -> "<root>/Content/Textures/T_Foo.uasset". The
+    mount segment (the package path's first segment -- "Game" above) is
+    always replaced by "Content", exactly like a real UEFN/UE project's
+    disk layout. Gated behind the "system_path" feature switch (default
+    True, independent of "collect_garbage")."""
+    path = _asset_ref_to_path(obj)
+    pkg = path.split(".", 1)[0] if "." in path else path
+    segments = [p for p in pkg.split("/") if p]
+    remainder = segments[1:]
+    disk_root = _state.get("project_disk_dir") or os.path.join(
+        tempfile.gettempdir(), "MockProj")
+    return os.path.join(disk_root, "Content", *remainder) + ".uasset"
 
 
 def _gate_module_attr(name, impl, enabled):
@@ -724,6 +760,8 @@ def _apply_feature_gates(features):
                       staticmethod(_get_project_root_asset_directory_impl),
                       features["project_root_api"])
     _gate_module_attr("SystemLibrary", _SystemLibraryImpl, features["collect_garbage"])
+    _gate_class_attr(_SystemLibraryImpl, "get_system_path",
+                      staticmethod(_get_system_path_impl), features["system_path"])
     _gate_class_attr(AssetTools, "rename_referencing_soft_object_paths",
                       _rename_referencing_soft_object_paths_impl,
                       features["soft_path_rename"])
@@ -760,6 +798,7 @@ def reset(features=None):
         "gc_calls": 0,
         "soft_rename_calls": [],
         "force_deleted": [],
+        "project_disk_dir": os.path.join(tempfile.gettempdir(), "MockProj"),
     }
     _apply_feature_gates(merged)
 
@@ -806,6 +845,14 @@ def set_project_root(path):
     """Set the mock project's root content mount, e.g. "/ProjectX". Read
     back via EditorAssetLibrary.get_project_root_asset_directory()."""
     _state["project_root"] = path.rstrip("/") if path else "/Game"
+
+
+def set_project_disk_dir(path):
+    """Set the mock's fake project disk root -- what unreal.SystemLibrary.
+    get_system_path() derives every fake on-disk asset path from (see
+    _get_system_path_impl()). Defaults to a "MockProj" folder under the
+    system temp dir (see reset())."""
+    _state["project_disk_dir"] = path
 
 
 # Initialize a valid default state as soon as the module is imported, so the
