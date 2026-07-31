@@ -156,28 +156,49 @@ class ResolveVerseSearchDirAutoDetectTests(unittest.TestCase):
 
         self.assertEqual(result, os.path.normpath(project_dir))
 
-    def test_picks_the_candidate_that_actually_has_verse_files(self):
-        # Two real candidates: the sample-derived one is empty, and
-        # unreal.Paths.project_dir() (lower priority) is monkeypatched to
-        # a SECOND, different real directory that has one real .verse
-        # file. The second must win -- not because of where it came from,
-        # but because it is the first candidate find_verse_files() finds
-        # anything under.
-        empty_dir = self._mkdtemp()
-        verse_dir = self._mkdtemp()
-        os.makedirs(os.path.join(verse_dir, "Content"))
-        with open(os.path.join(verse_dir, "Content", "foo.verse"), "w") as f:
-            f.write("using { /Game }\n")
+    def test_a_project_with_no_verse_files_never_falls_through_to_the_engine_dir(self):
+        # The reproduced bug, and the reason this used to assert the
+        # opposite: the user's real project has NO Verse code of its own,
+        # so the sample-derived candidate has nothing under it, while
+        # unreal.Paths.project_dir() (the Fortnite engine directory in
+        # UEFN) has plenty. Preferring "whichever candidate has files"
+        # then walked out of the project entirely and rewrote a file
+        # inside the Fortnite install.
+        #
+        # "Has .verse files" is evidence of Verse source, not evidence of
+        # WHOSE Verse source, so it can only ever choose between
+        # directories already known to belong to this project. The real
+        # project dir must win here even though it is empty.
+        project_dir = self._mkdtemp()
+        fortnite_engine_dir = self._mkdtemp()
+        os.makedirs(os.path.join(fortnite_engine_dir, "FortniteGame"))
+        with open(os.path.join(fortnite_engine_dir, "FortniteGame", "engine.verse"),
+                  "w") as f:
+            f.write("using { /Fortnite.com/Devices }\n")
 
-        mock_unreal.set_project_disk_dir(empty_dir)
+        mock_unreal.set_project_disk_dir(project_dir)
         mock_unreal.add_asset("/Game/Textures/T_Foo", "Texture2D")
-        mock_unreal.Paths.project_dir = staticmethod(lambda: verse_dir)
+        mock_unreal.Paths.project_dir = staticmethod(lambda: fortnite_engine_dir)
 
         result = self.sortilege.resolve_verse_search_dir(
             {}, sample_asset_paths=["/Game/Textures/T_Foo"])
 
-        self.assertEqual(result, os.path.normpath(verse_dir))
-        self.assertNotEqual(result, os.path.normpath(empty_dir))
+        self.assertEqual(result, os.path.normpath(project_dir))
+        self.assertNotEqual(result, os.path.normpath(fortnite_engine_dir))
+        # ...and nothing in the engine directory is ever even looked at.
+        self.assertEqual(self.sortilege.find_verse_files(result), [])
+
+    def test_paths_project_dir_is_not_a_candidate_at_all_without_a_sample(self):
+        # Nothing to derive from -> None, rather than "trust whatever
+        # unreal.Paths.project_dir() said". None means find_verse_files()
+        # returns nothing and the whole feature no-ops; the preview says
+        # so out loud and run_apply() refuses rather than half-doing it.
+        verse_dir = self._mkdtemp()
+        with open(os.path.join(verse_dir, "engine.verse"), "w") as f:
+            f.write("using { /Fortnite.com/Devices }\n")
+        mock_unreal.Paths.project_dir = staticmethod(lambda: verse_dir)
+
+        self.assertIsNone(self.sortilege.resolve_verse_search_dir({}))
 
     def test_sample_derived_candidate_wins_over_paths_project_dir_even_when_both_have_verse_files(self):
         # The exact bug scenario, reproduced: Paths.project_dir() (the
@@ -773,7 +794,12 @@ class AutoDetectProjectDirEndToEndTests(unittest.TestCase):
         # would have used this unconditionally and found zero real edits.
         mock_unreal.Paths.project_dir = staticmethod(lambda: self.fortnite_dir)
 
-        sortilege = helpers.load_sortilege()
+        # This test is about auto-DETECTION, and its fixture reference
+        # happens to be a bare root-level name; FIX_VERSE_BARE_NAMES is
+        # off by default now, so it is turned on explicitly here to keep
+        # the test exercising what it was written to exercise.
+        sortilege = helpers.load_sortilege(
+            config_overrides={"FIX_VERSE_BARE_NAMES": True})
         mock_unreal.set_project_root("/Root")
         mock_unreal.set_project_disk_dir(self.project_dir)
         mock_unreal.add_asset("/Root/T_Overshield_Enabled", "Texture2D")
@@ -824,6 +850,27 @@ class FixVerseBareNamesToggleTests(unittest.TestCase):
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
         return full
+
+    def test_config_defaults_the_toggle_off(self):
+        # A bare name is a plain word, and nothing in a .verse file says
+        # whether it is a moved asset or a local variable that happens to
+        # share the name. Guessing wrong writes a file that no longer
+        # compiles, so the default is to LIST these for the user instead
+        # of rewriting them -- while every qualified reference is still
+        # fixed automatically.
+        sortilege = helpers.load_sortilege(
+            config_overrides={"VERSE_SEARCH_DIR": self.tmp_dir})
+        self.assertFalse(sortilege.CONFIG["FIX_VERSE_BARE_NAMES"])
+
+        self._write("a.verse", "Ref := T_Foo\n")
+        mock_unreal.add_asset("/Game/T_Foo", "StaticMesh")
+        assets = [asset("/Game/T_Foo", "StaticMesh")]
+        plan = sortilege.build_plan(assets, sortilege.CONFIG,
+                                     sortilege.probe_capabilities())
+
+        self.assertEqual(len(plan["verse_edits"]), 1)
+        self.assertTrue(plan["verse_edits"][0]["skipped"])
+        self.assertEqual(plan["verse_edits"][0]["old_ref"], "T_Foo")
 
     def test_default_true_still_rewrites_bare_names_flagged_not_skipped(self):
         move = {"path": "/PremFN_1v1/T_Foo", "dest_path": "/PremFN_1v1/Sub/T_Foo",
@@ -993,8 +1040,11 @@ class VerseEditsGuiTabTests(unittest.TestCase):
         return full
 
     def test_verse_edits_tab_is_populated_from_the_plan_and_flags_bare_names(self):
-        sortilege = helpers.load_sortilege(
-            config_overrides={"VERSE_SEARCH_DIR": self.tmp_dir})
+        # The "(bare name - review)" note this asserts only exists for an
+        # edit that will actually be made, so this test needs bare-name
+        # rewriting explicitly on now that CONFIG defaults it off.
+        sortilege = helpers.load_sortilege(config_overrides={
+            "VERSE_SEARCH_DIR": self.tmp_dir, "FIX_VERSE_BARE_NAMES": True})
         self._write("a.verse", "Ref := T_Foo\n")
         mock_unreal.add_asset("/Game/T_Foo", "StaticMesh")
         assets = [asset("/Game/T_Foo", "StaticMesh")]
@@ -1099,6 +1149,371 @@ class VerseEditsResultsBarTests(unittest.TestCase):
 
         text = handles["state"]["result_var"].get()
         self.assertNotIn("Verse reference", text)
+
+
+# ---------------------------------------------------------------------------
+# The Verse fixup must not fail soft AFTER the point of no return.
+#
+# Reproduced by running the code: the fixup ran only once execute_plan()
+# had committed every move, so when it could not locate the project's
+# .verse source at that point, it rewrote nothing -- and the run still
+# finished with verify ok. Every asset had moved, every Verse reference
+# still named the old location, and the tool reported success.
+#
+# Locating the source is READ-ONLY, so it now happens before the moves,
+# and a run that can no longer see the .verse files the dry run just
+# found is refused at a point where refusing still costs nothing.
+# ---------------------------------------------------------------------------
+
+class VerseFixupBeforePointOfNoReturnTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="sortilege_verse_gate_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _write(self, relpath, content):
+        full = os.path.join(self.tmp_dir, relpath)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+        return full
+
+    def test_apply_is_refused_before_a_single_asset_moves(self):
+        # "system_path": False is this build's way of being unable to
+        # derive the project directory from an asset -- the dry run only
+        # got there through the VERSE_SEARCH_DIR override, which is gone
+        # by the time apply runs.
+        sortilege = helpers.load_sortilege(
+            features={"system_path": False},
+            config_overrides={"VERSE_SEARCH_DIR": self.tmp_dir})
+        verse_file = self._write("a.verse", "MyRock := Stuff.Rock\n")
+        mock_unreal.add_asset("/Game/Stuff/Rock", "StaticMesh")
+        assets = [asset("/Game/Stuff/Rock", "StaticMesh")]
+        caps = sortilege.probe_capabilities()
+        plan = sortilege.build_plan(assets, sortilege.CONFIG, caps)
+        self.assertEqual(plan["verse_files_count"], 1)
+
+        sortilege.CONFIG["VERSE_SEARCH_DIR"] = ""
+
+        outcome = sortilege.run_apply(plan, caps)
+
+        self.assertTrue(outcome.get("blocked"))
+        self.assertIsNone(outcome["undo_log"])
+        self.assertEqual(outcome["results"], {})
+        # The whole point of refusing HERE: the project is untouched, so
+        # there is nothing to undo and nothing left half-done.
+        lib = mock_unreal.EditorAssetLibrary
+        self.assertTrue(lib.does_asset_exist("/Game/Stuff/Rock"))
+        self.assertFalse(lib.does_asset_exist("/Game/Meshes/Rock"))
+        with open(verse_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "MyRock := Stuff.Rock\n")
+
+    def test_the_reason_names_both_ways_out(self):
+        sortilege = helpers.load_sortilege(
+            features={"system_path": False},
+            config_overrides={"VERSE_SEARCH_DIR": self.tmp_dir})
+        self._write("a.verse", "MyRock := Stuff.Rock\n")
+        mock_unreal.add_asset("/Game/Stuff/Rock", "StaticMesh")
+        assets = [asset("/Game/Stuff/Rock", "StaticMesh")]
+        caps = sortilege.probe_capabilities()
+        plan = sortilege.build_plan(assets, sortilege.CONFIG, caps)
+        sortilege.CONFIG["VERSE_SEARCH_DIR"] = ""
+
+        reason = sortilege.run_apply(plan, caps)["blocked"]
+
+        self.assertIn("VERSE_SEARCH_DIR", reason)
+        self.assertIn("FIX_VERSE_REFERENCES", reason)
+        self.assertIn("Nothing has been moved", reason)
+
+    def test_a_project_with_no_verse_code_is_never_blocked(self):
+        # The gate must be narrow enough that a project with no Verse
+        # source at all sorts exactly as it always did -- it has no Verse
+        # references to break, so it has nothing to lose.
+        sortilege = helpers.load_sortilege(features={"system_path": False})
+        mock_unreal.add_asset("/Game/Stuff/Rock", "StaticMesh")
+        assets = [asset("/Game/Stuff/Rock", "StaticMesh")]
+        caps = sortilege.probe_capabilities()
+        plan = sortilege.build_plan(assets, sortilege.CONFIG, caps)
+        self.assertEqual(plan["verse_files_count"], 0)
+
+        outcome = sortilege.run_apply(plan, caps)
+
+        self.assertIsNone(outcome.get("blocked"))
+        self.assertTrue(
+            mock_unreal.EditorAssetLibrary.does_asset_exist("/Game/Meshes/Rock"))
+
+    def _blocked_run_apply(self):
+        return lambda *a, **k: {
+            "blocked": "the dry run found 1 .verse file(s) to check, but "
+                       "the Verse source directory could not be located "
+                       "again now. Nothing has been moved.",
+            "plan_path": "x", "report_path": None, "undo_log": None,
+            "results": {},
+        }
+
+    def test_console_apply_reports_the_block_instead_of_a_run_summary(self):
+        # main()'s apply branch reads outcome["undo_log"].path to print
+        # the undo command, so a blocked outcome has to be recognized
+        # before any of that -- stubbed here (the same seam test_gui.py
+        # uses) to test the CALLER, not the gate.
+        sortilege = helpers.load_sortilege(config_overrides={
+            "I_UNDERSTAND_THIS_MODIFIES_MY_PROJECT": True})
+        mock_unreal.add_asset("/Game/Stuff/Rock", "StaticMesh")
+        mock_unreal.set_dialog_answer("Yes")
+
+        original_run_apply = sortilege.run_apply
+        sortilege.run_apply = self._blocked_run_apply()
+        try:
+            sortilege.main(mode="apply")
+        finally:
+            sortilege.run_apply = original_run_apply
+
+        state = mock_unreal.get_state()
+        logged = "\n".join(state["log"])
+        self.assertIn("APPLY BLOCKED", logged)
+        self.assertNotIn("Sortilege apply complete", logged)
+        self.assertIn("/Game/Stuff/Rock", state["assets"])
+
+    def test_gui_apply_leaves_the_window_usable_instead_of_showing_results(self):
+        # _show_results_bar() reads outcome["results"] and outcome
+        # ["report_path"] unconditionally, so the blocked outcome must
+        # never reach it. The window keeps its controls so the user can
+        # fix CONFIG and re-scan.
+        sortilege = helpers.load_sortilege()
+        mock_unreal.add_asset("/Game/Stuff/Rock", "StaticMesh")
+        assets = [asset("/Game/Stuff/Rock", "StaticMesh")]
+        caps = sortilege.probe_capabilities()
+        plan = sortilege.build_plan(assets, sortilege.CONFIG, caps)
+        handles = sortilege._build_preview_window(
+            _make_fake_tk_module(), _make_fake_ttk_module(), _FakeMessagebox,
+            plan, caps)
+
+        original_run_apply = sortilege.run_apply
+        sortilege.run_apply = self._blocked_run_apply()
+        try:
+            handles["apply_var"].set(True)
+            handles["on_apply"]()
+        finally:
+            sortilege.run_apply = original_run_apply
+
+        self.assertIsNone(handles["state"]["apply_outcome"])
+        self.assertIsNone(handles["state"].get("result_var"))
+        self.assertFalse(handles["state"]["busy"])
+
+    def test_verify_is_not_ok_when_a_verse_file_could_not_be_rewritten(self):
+        # The other half of the same failure: the rewrite pass runs after
+        # the moves, so a .verse file it could not write is a file whose
+        # references now point at the old location. A run that ends that
+        # way is not ok, and must not say it is.
+        sortilege = helpers.load_sortilege()
+        caps = sortilege.probe_capabilities()
+        results = {
+            "moved": [],
+            "verse_edits": {"edited": [], "backup_index": None,
+                            "failed": [("a.verse", "permission denied")]},
+        }
+
+        verify = sortilege.verify_results(results, [], caps)
+
+        self.assertFalse(verify["ok"])
+        self.assertEqual(verify["verse_failures"], [("a.verse", "permission denied")])
+
+    def test_verify_stays_ok_when_the_verse_stage_never_ran(self):
+        # SAFE_MODE, FIX_VERSE_REFERENCES off, or simply nothing to do:
+        # no verse_edits key at all must read as "not checked", never as
+        # a failure.
+        sortilege = helpers.load_sortilege()
+        caps = sortilege.probe_capabilities()
+
+        verify = sortilege.verify_results({"moved": []}, [], caps)
+
+        self.assertTrue(verify["ok"])
+        self.assertEqual(verify["verse_failures"], [])
+
+
+# ---------------------------------------------------------------------------
+# A Verse reference is only a reference in CODE.
+#
+# Reproduced by running the code: the rewrite was pure regex over the
+# whole line, so it edited matches inside comments and string literals,
+# and it turned "var Sphere : int = 9" -- a variable that merely shares a
+# moved asset's name -- into "var Meshes.Sphere : int = 9", which does
+# not compile. Both cases now go through _replace_verse_ref(), which
+# build_verse_edits() and apply_verse_edits() share, so the preview and
+# the file on disk can never disagree about what gets touched.
+# ---------------------------------------------------------------------------
+
+class VerseSyntaxAwareRewriteTests(unittest.TestCase):
+    def setUp(self):
+        self.sortilege = helpers.load_sortilege()
+        self.tmp_dir = tempfile.mkdtemp(prefix="sortilege_verse_syntax_")
+        self.log_dir = tempfile.mkdtemp(prefix="sortilege_verse_syntax_logs_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        shutil.rmtree(self.log_dir, ignore_errors=True)
+
+    def _write(self, relpath, content):
+        full = os.path.join(self.tmp_dir, relpath)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+        return full
+
+    def _sphere_move(self):
+        return {"path": "/PremFN_1v1/Sphere",
+                "dest_path": "/PremFN_1v1/Meshes/Sphere",
+                "dest_folder": "/PremFN_1v1/Meshes"}
+
+    def test_a_declared_variable_sharing_the_name_is_never_rewritten(self):
+        verse_file = self._write("a.verse", "var Sphere : int = 9\n")
+
+        edits = self.sortilege.build_verse_edits(
+            [self._sphere_move()], [verse_file], ["/PremFN_1v1"],
+            fix_bare_names=True)
+
+        self.assertEqual(edits, [])
+
+    def test_a_defined_name_is_never_rewritten(self):
+        verse_file = self._write("a.verse", "Sphere := 9\n")
+
+        edits = self.sortilege.build_verse_edits(
+            [self._sphere_move()], [verse_file], ["/PremFN_1v1"],
+            fix_bare_names=True)
+
+        self.assertEqual(edits, [])
+
+    def test_a_genuine_reference_on_a_declaration_line_still_gets_rewritten(self):
+        # The guard is per-occurrence, not per-line: the name being
+        # declared here is Radius, and Sphere is a real reference.
+        verse_file = self._write("a.verse", "Radius : float = Sphere\n")
+
+        edits = self.sortilege.build_verse_edits(
+            [self._sphere_move()], [verse_file], ["/PremFN_1v1"],
+            fix_bare_names=True)
+
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["new_line"], "Radius : float = Meshes.Sphere")
+
+    def test_comments_and_string_literals_are_left_alone(self):
+        # Dotted refs, so this holds regardless of FIX_VERSE_BARE_NAMES.
+        move = {"path": "/PremFN_1v1/Stuff/Rock",
+                "dest_path": "/PremFN_1v1/Meshes/Rock",
+                "dest_folder": "/PremFN_1v1/Meshes"}
+        verse_file = self._write(
+            "a.verse",
+            "# Stuff.Rock used to live here\n"
+            'Label := "Stuff.Rock"\n'
+            "Real := Stuff.Rock\n")
+
+        edits = self.sortilege.build_verse_edits([move], [verse_file], ["/PremFN_1v1"])
+
+        self.assertEqual([e["line_no"] for e in edits], [3])
+        self.assertEqual(edits[0]["new_line"], "Real := Meshes.Rock")
+
+    def test_a_trailing_comment_never_shields_the_code_before_it(self):
+        move = {"path": "/PremFN_1v1/Stuff/Rock",
+                "dest_path": "/PremFN_1v1/Meshes/Rock",
+                "dest_folder": "/PremFN_1v1/Meshes"}
+        verse_file = self._write("a.verse", "Real := Stuff.Rock # Stuff.Rock\n")
+
+        edits = self.sortilege.build_verse_edits([move], [verse_file], ["/PremFN_1v1"])
+
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["count"], 1)
+        self.assertEqual(edits[0]["new_line"], "Real := Meshes.Rock # Stuff.Rock")
+
+    def test_apply_refuses_on_disk_exactly_what_the_preview_refused(self):
+        # apply_verse_edits() re-derives the substitution from old_ref/
+        # new_ref against the file's current contents rather than writing
+        # the preview's precomputed new_line, so the guard has to hold
+        # THERE too. This hands it the edit the old code would have
+        # produced for a declaration line and checks the file on disk.
+        original = "var Sphere : int = 9\n"
+        verse_file = self._write("a.verse", original)
+        edits = [{
+            "file": verse_file, "line_no": 1,
+            "old_line": "var Sphere : int = 9",
+            "new_line": "var Sphere : int = 9",
+            "old_ref": "Sphere", "new_ref": "Meshes.Sphere",
+            "is_bare": True, "count": 1, "kind": "ref", "skipped": False,
+        }]
+
+        self.sortilege.apply_verse_edits(edits, self.log_dir)
+
+        with open(verse_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_apply_refuses_a_comment_occurrence_on_disk_too(self):
+        original = "# Stuff.Rock used to live here\n"
+        verse_file = self._write("a.verse", original)
+        edits = [{
+            "file": verse_file, "line_no": 1,
+            "old_line": original.rstrip("\n"), "new_line": original.rstrip("\n"),
+            "old_ref": "Stuff.Rock", "new_ref": "Meshes.Rock",
+            "is_bare": False, "count": 1, "kind": "ref", "skipped": False,
+        }]
+
+        self.sortilege.apply_verse_edits(edits, self.log_dir)
+
+        with open(verse_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+
+
+# ---------------------------------------------------------------------------
+# One .verse file, one backup.
+#
+# Reproduced by running the code: backup names folded every path
+# separator to "_", so "Content/a/b.verse" and "Content/a_b.verse" both
+# became "Content_a_b.verse". The second backup overwrote the first, and
+# undo then restored one file's contents into BOTH files -- an undo that
+# corrupts is worse than no undo at all.
+# ---------------------------------------------------------------------------
+
+class VerseBackupCollisionTests(unittest.TestCase):
+    def setUp(self):
+        self.sortilege = helpers.load_sortilege()
+        self.tmp_dir = tempfile.mkdtemp(prefix="sortilege.verse.collide.")
+        self.log_dir = tempfile.mkdtemp(prefix="sortilege.verse.collide.logs.")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        shutil.rmtree(self.log_dir, ignore_errors=True)
+
+    def test_a_separator_and_a_literal_underscore_map_to_different_backups(self):
+        nested = self.sortilege._verse_backup_path(
+            "/backups", os.path.join("/proj", "Content", "a", "b.verse"))
+        flat = self.sortilege._verse_backup_path(
+            "/backups", os.path.join("/proj", "Content", "a_b.verse"))
+
+        self.assertNotEqual(nested, flat)
+
+    def test_undo_restores_each_file_its_own_contents(self):
+        os.makedirs(os.path.join(self.tmp_dir, "a"))
+        nested_path = os.path.join(self.tmp_dir, "a", "b.verse")
+        flat_path = os.path.join(self.tmp_dir, "a_b.verse")
+        nested_original = "Nested := Stuff.Rock\n"
+        flat_original = "Flat := Stuff.Rock\n"
+        for path, content in ((nested_path, nested_original),
+                              (flat_path, flat_original)):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+        move = {"path": "/Game/Stuff/Rock", "dest_path": "/Game/Meshes/Rock",
+                "dest_folder": "/Game/Meshes"}
+        edits = self.sortilege.build_verse_edits(
+            [move], [nested_path, flat_path], ["/Game"])
+        self.assertEqual(len(edits), 2)
+
+        apply_result = self.sortilege.apply_verse_edits(edits, self.log_dir)
+        self.assertEqual(apply_result["failed"], [])
+
+        undo_result = self.sortilege.undo_verse_edits(apply_result["backup_index"])
+        self.assertEqual(undo_result["failed"], [])
+
+        with open(nested_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), nested_original)
+        with open(flat_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), flat_original)
 
 
 if __name__ == "__main__":

@@ -176,19 +176,20 @@ CONFIG = {
     # cannot compile Verse -- always run Build Verse Code in UEFN
     # afterward to confirm your project still compiles.
     "FIX_VERSE_REFERENCES": True,
-    # True = also rewrite a BARE root-level Verse reference (a plain name
-    # with no folder qualification at all, like "T_Hex" -- see the
-    # README's "Fixing Verse references" section). A bare name is a
-    # plain word with nothing to distinguish it from an unrelated
-    # identifier that merely happens to match, so it is always flagged
-    # "(bare name - review)" in the preview either way. Set this to
-    # False to SKIP bare-name rewrites entirely (they are listed in the
-    # preview/report as "skipped (bare name - fix manually)" instead, so
-    # you know to handle those by hand) while still rewriting every
-    # qualified (dotted) reference automatically -- the common,
-    # provably-safe case this feature exists for. Ignored when
-    # FIX_VERSE_REFERENCES above is False.
-    "FIX_VERSE_BARE_NAMES": True,
+    # False (the default) = do NOT rewrite a BARE root-level Verse
+    # reference (a plain name with no folder qualification at all, like
+    # "T_Hex" -- see the README's "Fixing Verse references" section).
+    # A bare name is a plain word with nothing to distinguish it from an
+    # unrelated identifier that merely happens to match: a local variable,
+    # a parameter, a function name. Nothing in the file says which one it
+    # is, so these are listed in the preview and the report as "skipped
+    # (bare name - fix manually)" for you to handle by hand, while every
+    # qualified (dotted) reference -- the common, checkable case this
+    # feature exists for -- is still rewritten automatically. Set this to
+    # True to rewrite bare names too; they are always flagged "(bare name
+    # - review)" in the preview when you do. Ignored when FIX_VERSE_
+    # REFERENCES above is False.
+    "FIX_VERSE_BARE_NAMES": False,
     # "" = auto-detect this project's real directory from a scanned
     # asset's on-disk path (unreal.SystemLibrary.get_system_path()) and
     # look for .verse source files there. Deliberately NOT unreal.Paths.
@@ -1170,15 +1171,8 @@ def resolve_verse_search_dir(config, sample_asset_paths=None):
     files and produced zero edits even though the user's real project had
     a genuine Verse reference to a moved asset.
 
-    This now builds an ORDERED list of candidate directories and returns
-    the FIRST one for which find_verse_files() actually finds something --
-    whichever real directory demonstrably HAS Verse source wins, rather
-    than trusting any single link in the chain blindly. If no candidate
-    has files, the first non-None candidate is returned anyway, so the
-    "Verse fixup: N file(s) found under X" diagnostic still names a real
-    path instead of going blank.
+    Only two sources are ever trusted, because only two can be CHECKED:
 
-    Candidate order:
     1. CONFIG["VERSE_SEARCH_DIR"] if set -- trusted as-is, unconditionally,
        no files check at all. The user said "look here"; honor it, same
        as always. Short-circuits everything below.
@@ -1193,22 +1187,36 @@ def resolve_verse_search_dir(config, sample_asset_paths=None):
        fix for the bug above. Up to 5 sample paths are tried; each is its
        own hasattr-gated, try/except attempt -- one bad/stale sample never
        blocks the rest.
-    3. unreal.Paths.project_dir() -- kept only as a low-priority fallback
-       now (this is the call that returns the Fortnite engine dir in
-       UEFN; see the bug above).
-    4. unreal.SystemLibrary.get_project_directory().
+
+    unreal.Paths.project_dir() and unreal.SystemLibrary.get_project_
+    directory() are deliberately NOT consulted, not even as a last
+    resort. project_dir() is the exact call the bug above proved returns
+    the Fortnite engine directory, and nothing about its return value
+    says which project it names -- so a project that simply has no Verse
+    code of its own would fall through to it, find Fortnite's own .verse
+    files, and edit somebody else's install. An asset-derived directory
+    is the only candidate that carries its own proof: the assets being
+    moved genuinely live under it.
+
+    Several sample paths CAN legitimately derive different directories
+    (discover_content_roots() can return more than one mount), so the
+    files check still runs: the first derived directory that actually has
+    .verse source under it wins, and the first derived one is returned
+    when none of them do -- the "Verse fixup: N file(s) found under X"
+    diagnostic then still names a real path.
 
     Every optional API is hasattr-gated AND wrapped in its own try/except,
     same as resolve_log_dir() -- a build (or, in tests, the mock) that
-    simply does not define one of these getters just falls through to the
-    next link.
+    simply does not define one of these getters just falls through.
 
     Unlike resolve_log_dir(), this deliberately does NOT fall back to the
     script's own folder or the current working directory when nothing
     resolves: a log dir must exist somewhere to write to, but there is no
     safe default folder to blind-walk looking for Verse source, so
     "nothing resolved at all" fails soft to None -- find_verse_files(None)
-    simply returns no files, and the whole feature quietly no-ops."""
+    simply returns no files, and the whole feature quietly no-ops (and
+    run_apply() refuses to move anything when the preview DID find Verse
+    files it can no longer see; see its docstring)."""
     raw = config.get("VERSE_SEARCH_DIR", "") or ""
     if raw:
         return os.path.normpath(raw)
@@ -1231,30 +1239,6 @@ def resolve_verse_search_dir(config, sample_asset_paths=None):
                     candidates.append(project_dir)
             except Exception:
                 continue
-
-    if unreal is not None:
-        try:
-            if hasattr(unreal, "Paths") and hasattr(unreal.Paths, "project_dir"):
-                candidate = unreal.Paths.project_dir()
-                if candidate:
-                    norm = os.path.normpath(str(candidate))
-                    if norm not in candidates:
-                        candidates.append(norm)
-        except Exception:
-            pass
-
-    if unreal is not None:
-        try:
-            if hasattr(unreal, "SystemLibrary") and hasattr(
-                unreal.SystemLibrary, "get_project_directory"
-            ):
-                candidate = unreal.SystemLibrary.get_project_directory()
-                if candidate:
-                    norm = os.path.normpath(str(candidate))
-                    if norm not in candidates:
-                        candidates.append(norm)
-        except Exception:
-            pass
 
     if not candidates:
         return None
@@ -1347,6 +1331,103 @@ def _verse_ref_pattern(old_ref):
 # using { /Some/Folder/Path } -- captures the path text between the
 # braces (non-whitespace, backtracks past a trailing "}").
 _USING_STATEMENT_RE = re.compile(r"using\s*\{\s*(\S+?)\s*\}")
+
+
+# A bare identifier immediately followed by ":" is being DECLARED right
+# there, not referenced -- "Sphere : int = 9" (a typed declaration) and
+# "Sphere := 9" (a definition) both name a NEW thing that merely happens
+# to share a moved asset's name. Anchored at the character just past the
+# match, and deliberately [ \t] rather than \s so it can never reach onto
+# the next line through a trailing newline.
+_VERSE_DECLARATION_RE = re.compile(r"[ \t]*:")
+
+
+def _verse_code_spans(line):
+    """Return the [(start, end), ...] character ranges of `line` that are
+    real CODE: everything outside a double-quoted string literal, and
+    everything before an unquoted "#".
+
+    A Verse reference only means anything to the compiler in code. The
+    same text inside a comment or a string literal is prose or data, and
+    rewriting it is at best noise and at worst a behavior change (a
+    string the project actually displays or compares against). Verse's
+    block comment opens with "<#", so the leading "#" rule already ends
+    the code region at the right character for a block comment too.
+
+    Deliberately line-local, exactly like every other rewrite in this
+    file: the INNER lines of a multi-line "<# ... #>" block comment have
+    no "#" of their own and still read as code here, and code following a
+    closed single-line "<# ... #>" reads as comment. Both misreads are
+    one-directional -- they can only ever make this file rewrite LESS
+    than it might, never more -- which is the right way round for a
+    guard whose entire job is to not touch what it does not understand.
+    Tracking Verse block-comment nesting properly needs a real lexer,
+    which is a bigger change than this fix wants to be."""
+    spans = []
+    start = 0
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch == '"':
+            if i > start:
+                spans.append((start, i))
+            i += 1
+            while i < n:
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            start = i
+            continue
+        if ch == "#":
+            break
+        i += 1
+    if i > start:
+        spans.append((start, i))
+    return spans
+
+
+def _replace_verse_ref(line, old_ref, new_ref):
+    """The ONE place a Verse reference is ever rewritten. Returns
+    (new_line, replaced_count), counting only occurrences actually
+    changed -- build_verse_edits() uses it to decide whether a line is
+    worth an edit at all, and apply_verse_edits() uses it again to make
+    the same change on disk, so the two can never disagree about what a
+    line becomes.
+
+    On top of _verse_ref_pattern()'s boundary safety, two occurrences are
+    left alone:
+
+    * anything outside _verse_code_spans(line) -- a comment or a string
+      literal, which is not a reference.
+    * a BARE identifier (no "." and no "/", so a root-level asset name,
+      never a dotted ref or a using-statement path) immediately followed
+      by ":". That is a declaration of something new, and "var Sphere :
+      int = 9" rewritten to "var Meshes.Sphere : int = 9" is not a fixed
+      reference, it is a file that no longer compiles. A dotted ref and a
+      slash path are exempt from this check because neither can ever be a
+      declaration target."""
+    spans = _verse_code_spans(line)
+    if not spans:
+        return line, 0
+
+    bare_identifier = ("." not in old_ref) and ("/" not in old_ref)
+    replaced = [0]
+
+    def _swap(match):
+        pos = match.start()
+        if not any(s <= pos < e for s, e in spans):
+            return match.group(0)
+        if bare_identifier and _VERSE_DECLARATION_RE.match(line, match.end()):
+            return match.group(0)
+        replaced[0] += 1
+        return new_ref
+
+    return _verse_ref_pattern(old_ref).sub(_swap, line), replaced[0]
 
 
 def build_verse_edits(plan_moves, verse_files, content_roots, fix_bare_names=True):
@@ -1444,13 +1525,16 @@ def build_verse_edits(plan_moves, verse_files, content_roots, fix_bare_names=Tru
 
             for old_ref, new_ref in ref_pairs:
                 is_bare = "." not in old_ref
-                pattern = _verse_ref_pattern(old_ref)
                 if is_bare and not fix_bare_names:
                     # Found, but deliberately left unrewritten -- listed
                     # as "skipped (bare name - fix manually)" so the user
                     # knows to handle it by hand instead of it silently
-                    # vanishing from the preview/report.
-                    count = len(pattern.findall(line))
+                    # vanishing from the preview/report. Counted through
+                    # the same _replace_verse_ref() the rewrite would use,
+                    # so this lists exactly what WOULD have changed -- a
+                    # match in a comment or a declaration is not a pending
+                    # manual fix, it is nothing at all.
+                    _, count = _replace_verse_ref(line, old_ref, new_ref)
                     if count:
                         edits.append({
                             "file": file_path, "line_no": line_no,
@@ -1460,7 +1544,7 @@ def build_verse_edits(plan_moves, verse_files, content_roots, fix_bare_names=Tru
                             "kind": "ref", "skipped": True,
                         })
                     continue
-                new_line, count = pattern.subn(new_ref, line)
+                new_line, count = _replace_verse_ref(line, old_ref, new_ref)
                 if count:
                     edits.append({
                         "file": file_path, "line_no": line_no,
@@ -1477,8 +1561,8 @@ def build_verse_edits(plan_moves, verse_files, content_roots, fix_bare_names=Tru
                     for old_folder, new_folder in folder_pairs:
                         if used_path != old_folder:
                             continue
-                        pattern = _verse_ref_pattern(old_folder)
-                        new_line, count = pattern.subn(new_folder, line)
+                        new_line, count = _replace_verse_ref(
+                            line, old_folder, new_folder)
                         if count:
                             edits.append({
                                 "file": file_path, "line_no": line_no,
@@ -1558,13 +1642,25 @@ def _verse_backup_path(backup_dir, file_path):
     backup filename under `backup_dir`: the drive letter (if any) and
     every path separator are folded into one "_"-joined component, so two
     files that only differ by folder (or drive) can never collide the
-    way two bare basenames could."""
+    way two bare basenames could.
+
+    Folding separators to "_" is not by itself enough, because a "_" that
+    was ALREADY in the path is indistinguishable from one that used to be
+    a separator: "Content/a/b.verse" and "Content/a_b.verse" both folded
+    down to "Content_a_b.verse", so whichever was backed up second
+    overwrote the other's backup and undo_verse_edits() then restored the
+    same contents to both files. Every literal "_" is therefore escaped
+    to "__" BEFORE separators are folded (order matters -- the other way
+    round re-escapes the separators too and loses the distinction again).
+    That makes the mapping injective: the pair above now backs up as
+    "Content_a_b.verse" and "Content_a__b.verse". Paths with no "_" in
+    them keep exactly the readable name they had before."""
     norm = os.path.normpath(file_path)
     drive, rest = os.path.splitdrive(norm)
     rest = rest.replace("\\", "/").strip("/")
-    safe = rest.replace("/", "_")
+    safe = rest.replace("_", "__").replace("/", "_")
     if drive:
-        safe = drive.rstrip(":") + "_" + safe
+        safe = drive.rstrip(":").replace("_", "__") + "_" + safe
     return os.path.join(backup_dir, safe or "verse_file")
 
 
@@ -1579,7 +1675,11 @@ def apply_verse_edits(edits, log_dir):
     on-disk content (read fresh here, never a stale snapshot a caller
     might be holding from preview time), so two edits landing on the same
     line both take effect correctly instead of one clobbering the
-    other's precomputed "new_line" text.
+    other's precomputed "new_line" text. That re-application goes through
+    _replace_verse_ref(), the same helper that produced "new_line" in the
+    first place -- a comment, string literal, or declaration the preview
+    refused to touch is therefore refused here too, rather than the file
+    on disk quietly getting a rewrite the preview never showed.
 
     Every file is its own try/except -- fail-soft, one bad file (missing,
     permission error, whatever) never aborts the rest of the batch; it is
@@ -1629,8 +1729,8 @@ def apply_verse_edits(edits, log_dir):
                 idx = e["line_no"] - 1
                 if idx < 0 or idx >= len(current_lines):
                     continue
-                pattern = _verse_ref_pattern(e["old_ref"])
-                current_lines[idx] = pattern.sub(e["new_ref"], current_lines[idx])
+                current_lines[idx], _ = _replace_verse_ref(
+                    current_lines[idx], e["old_ref"], e["new_ref"])
 
             tmp_path = file_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2077,12 +2177,13 @@ def _format_verify(verify):
     if not verify:
         return "not run"
     return ("ok=%s missing=%d old_paths_alive=%d leftover_redirectors=%d "
-            "broken_soft_refs=%d") % (
+            "broken_soft_refs=%d verse_failures=%d") % (
         verify.get("ok"),
         len(verify.get("missing", [])),
         len(verify.get("old_paths_alive", [])),
         len(verify.get("leftover_redirectors", [])),
         len(verify.get("broken_soft_refs", [])),
+        len(verify.get("verse_failures", [])),
     )
 
 
@@ -2960,7 +3061,7 @@ def verify_results(results, scope_folders, caps):
     """Double-check an apply run's outcome. Returns {"ok": bool,
     "missing": [...], "old_paths_alive": [...], "leftover_redirectors":
     [...], "referencer_spot_checks": int, "broken_soft_refs": [(referencer,
-    old_path), ...]}.
+    old_path), ...], "verse_failures": [(file, error), ...]}.
 
     For every moved (old, new) pair: `new` must exist (else -> missing);
     `old` must no longer resolve to a REAL (non-redirector) asset --
@@ -2986,11 +3087,25 @@ def verify_results(results, scope_folders, caps):
     skipped (like the referencer_spot_checks above, it degrades to "not
     checked", never to a false "broken").
 
-    `ok` = no missing AND no old_paths_alive AND no broken_soft_refs."""
+    A .verse file the Verse fixup could not write (results["verse_edits"]
+    ["failed"]) is copied into "verse_failures" and counts against `ok`.
+    That pass runs after the assets have already moved, so a file it
+    failed to rewrite is a file whose references now point at the OLD
+    location: a real broken reference, and exactly the kind of thing a
+    run must not describe as ok. Absent entirely (SAFE_MODE, FIX_VERSE_
+    REFERENCES off, or an unreal-less environment) it stays empty and
+    changes nothing.
+
+    `ok` = no missing AND no old_paths_alive AND no broken_soft_refs AND
+    no verse_failures."""
     out = {"ok": True, "missing": [], "old_paths_alive": [],
            "leftover_redirectors": [], "referencer_spot_checks": 0,
-           "broken_soft_refs": []}
+           "broken_soft_refs": [], "verse_failures": []}
+    for entry in ((results or {}).get("verse_edits") or {}).get("failed", []):
+        if entry not in out["verse_failures"]:
+            out["verse_failures"].append(entry)
     if unreal is None:
+        out["ok"] = not out["verse_failures"]
         return out
 
     lib = unreal.EditorAssetLibrary
@@ -3044,6 +3159,7 @@ def verify_results(results, scope_folders, caps):
         (not out["missing"])
         and (not out["old_paths_alive"])
         and (not out["broken_soft_refs"])
+        and (not out["verse_failures"])
     )
     return out
 
@@ -3896,10 +4012,21 @@ def run_apply(plan, caps, extra_progress=None, status_callback=None):
     pair. verify_results() is unaffected by SAFE_MODE -- it only reads --
     and still runs unless CONFIG["VERIFY_AFTER"] is False.
 
+    The Verse fixup's read-only half (locating the project's .verse
+    source) happens BEFORE the moves, and refuses the whole run when the
+    dry run found Verse files this pass can no longer see -- see the
+    comment on that block. Nothing has moved at that point, so the
+    refusal costs the user nothing.
+
     Returns {"plan_path": str, "report_path": str, "undo_log": UndoLog,
     "results": dict}. `results` is exactly what execute_plan()/
     _run_with_progress() returned, with "redirector_cleanup" / "verify"
-    keys layered on when those passes ran."""
+    keys layered on when those passes ran.
+
+    A refused run instead returns {"blocked": reason, "plan_path": str,
+    "report_path": None, "undo_log": None, "results": {}} -- the same
+    "blocked" contract run_undo() already uses. Callers check for it
+    before reading anything else; NOTHING was changed when it is set."""
     def _status(text):
         if status_callback is not None:
             try:
@@ -3913,6 +4040,53 @@ def run_apply(plan, caps, extra_progress=None, status_callback=None):
     tracer = CrashTracer.begin(log_dir)
     safe_mode = bool(CONFIG.get("SAFE_MODE", False))
     gc_enabled = _effective_gc_enabled(caps, CONFIG)
+
+    # BEFORE the point of no return. Everything in this block only READS
+    # (resolve a directory, walk it for .verse files), and it is the one
+    # part of the Verse fixup that can fail for reasons that have nothing
+    # to do with the moves. It used to run after execute_plan(), which
+    # meant a failure to locate the project's Verse source was discovered
+    # only once every asset had already moved: nothing got rewritten, the
+    # run still reported success, and the user was left with a project
+    # whose Verse no longer compiles. Resolving here turns that into
+    # "nothing happened yet, here is why" -- the assets have not moved,
+    # so there is still something to refuse.
+    #
+    # Sampling from the plan's SOURCE paths (rather than the post-move
+    # destinations) is also strictly more reliable: pre-move, those are
+    # live assets; post-move, the old paths are redirectors.
+    #
+    # The gate is deliberately narrow. It fires only when the preview
+    # DID find .verse files (plan["verse_files_count"]) and this pass can
+    # no longer see any -- the one situation where the Verse fixup is
+    # certain to silently do nothing. A project with no Verse code at all
+    # has a count of 0, loses nothing, and is never blocked.
+    do_verse_fix = CONFIG.get("FIX_VERSE_REFERENCES", True) and not safe_mode
+    verse_files = []
+    if do_verse_fix and plan.get("moves"):
+        verse_sample_paths = [m["path"] for m in plan.get("moves", [])][:5]
+        verse_dir = resolve_verse_search_dir(
+            CONFIG, sample_asset_paths=verse_sample_paths)
+        verse_files = find_verse_files(verse_dir)
+        if plan.get("verse_files_count", 0) and not verse_files:
+            reason = (
+                "the dry run found %d .verse file(s) to check, but the "
+                "Verse source directory could not be located again now. "
+                "Nothing has been moved. Set VERSE_SEARCH_DIR in CONFIG "
+                "to your UEFN project folder (the one containing your "
+                ".uefnproject) and run again, or set FIX_VERSE_REFERENCES "
+                "to False to sort without the Verse fixup and update your "
+                "Verse references by hand."
+                % plan.get("verse_files_count", 0))
+            tracer.mark("BLOCKED before moves: %s" % reason)
+            _console_warning("Sortilege: APPLY BLOCKED - %s" % reason)
+            return {
+                "blocked": reason,
+                "plan_path": plan_path,
+                "report_path": None,
+                "undo_log": None,
+                "results": {},
+            }
 
     ensure_directories(plan)
     undo_log = UndoLog.begin(log_dir, plan)
@@ -3967,7 +4141,13 @@ def run_apply(plan, caps, extra_progress=None, status_callback=None):
     # sweep. Built from results["moved"] -- the ACTUALLY-moved pairs, not
     # the full plan -- so a partially-failed batch only ever rewrites
     # Verse refs for assets that genuinely ended up at their new path.
-    do_verse_fix = CONFIG.get("FIX_VERSE_REFERENCES", True) and not safe_mode
+    #
+    # `verse_files` was resolved BEFORE the moves (see above) and is
+    # reused as-is: nothing about locating Verse source is re-attempted
+    # after the point of no return, so it cannot fail there. .verse files
+    # are source on disk, untouched by an asset move, so the list is
+    # still accurate -- and apply_verse_edits() re-reads every file's
+    # current contents before writing anyway.
     if safe_mode:
         tracer.mark("SAFE_MODE active: skipping verse-references")
     if do_verse_fix:
@@ -3975,13 +4155,6 @@ def run_apply(plan, caps, extra_progress=None, status_callback=None):
         tracer.mark("STAGE >>> entering: verse-references")
         moved_as_moves = [{"path": old, "dest_path": new}
                           for old, new in results.get("moved", [])]
-        # Sample from the NEW (post-move) paths -- they are real,
-        # existing assets right now, unlike the old paths (redirectors).
-        # Same auto-detect mechanism build_plan() uses; see
-        # resolve_verse_search_dir()'s docstring.
-        verse_sample_paths = [mv["dest_path"] for mv in moved_as_moves][:5]
-        verse_dir = resolve_verse_search_dir(CONFIG, sample_asset_paths=verse_sample_paths)
-        verse_files = find_verse_files(verse_dir)
         verse_edit_list = build_verse_edits(
             moved_as_moves, verse_files, discover_content_roots(),
             fix_bare_names=CONFIG.get("FIX_VERSE_BARE_NAMES", True))
@@ -4797,6 +4970,15 @@ def _build_preview_window(tk, ttk, messagebox, plan, caps):
 
             outcome = run_apply(state["plan"], state["caps"], extra_progress=_pump,
                                  status_callback=_gui_status_callback)
+            if outcome.get("blocked"):
+                # Refused before anything moved. The window stays exactly
+                # as it was -- checkbox, Apply button and all -- so the
+                # user can fix CONFIG and re-scan rather than being shown
+                # a results bar for a run that never happened.
+                error_var.set("Apply blocked: %s" % outcome["blocked"])
+                state["busy"] = False
+                _set_controls_state(True)
+                return
             state["apply_outcome"] = outcome
             _show_results_bar(outcome)
         except Exception as exc:
@@ -4966,6 +5148,12 @@ def main(mode=None):
         return
 
     outcome = run_apply(plan, caps)
+    if outcome.get("blocked"):
+        # run_apply() refused before touching anything -- it has already
+        # printed the reason. Nothing to report, nothing to undo.
+        _console("APPLY BLOCKED - nothing was changed.")
+        return
+
     results = outcome["results"]
     undo_log = outcome["undo_log"]
     plan_path = outcome["plan_path"]
